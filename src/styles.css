@@ -1,0 +1,388 @@
+/* Seat Assist — panel styles.
+   All rules are scoped under #nts-panel / #nts-banner so nothing leaks into the
+   host shop page. Design tokens live on #nts-panel as CSS custom properties. */
+
+#nts-panel {
+  --nts-bg: #15151a;
+  --nts-surface: #1e1e25;
+  --nts-surface-2: #272730;
+  --nts-border: #2c2c35;
+  --nts-border-2: #3a3a46;
+  --nts-text: #ececf1;
+  --nts-muted: #9a9aa6;
+  --nts-faint: #6b6b76;
+  --nts-accent: #e2001a;
+  --nts-green: #1f9d55;
+  --nts-green-2: #23b061;
+  --nts-green-bg: #12321f;
+  --nts-green-text: #6fe6a1;
+  --nts-red: #c23b3b;
+  --nts-red-bg: #3a1414;
+  --nts-red-text: #ff9b9b;
+  --nts-code-bg: #101014;
+  --nts-nonseat-bg: #24242c;
+  --nts-nonseat-line: #4a4a57;
+  --nts-scroll: #33333d;
+  --nts-r: 10px;
+  --nts-r-sm: 7px;
+  --nts-r-xs: 5px;
+
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  z-index: 2147483647;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--nts-text);
+  background: var(--nts-bg);
+  border: 1px solid var(--nts-border);
+  border-radius: var(--nts-r);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+#nts-panel *,
+#nts-panel *::before,
+#nts-panel *::after { box-sizing: border-box; }
+
+/* Follow the browser/OS setting. Dark is the default (tokens above); light
+   kicks in automatically when the system prefers a light appearance. */
+@media (prefers-color-scheme: light) {
+  #nts-panel {
+    --nts-bg: #ffffff;
+    --nts-surface: #f4f4f7;
+    --nts-surface-2: #e9e9ef;
+    --nts-border: #e3e3ea;
+    --nts-border-2: #d3d3dc;
+    --nts-text: #1b1b22;
+    --nts-muted: #64646f;
+    --nts-faint: #9a9aa6;
+    --nts-accent: #e2001a;
+    --nts-green: #16a34a;
+    --nts-green-2: #128a3e;
+    --nts-green-bg: #e6f6ec;
+    --nts-green-text: #157f3a;
+    --nts-red: #d64545;
+    --nts-red-bg: #fdecec;
+    --nts-red-text: #c0392b;
+    --nts-code-bg: #f3f3f6;
+    --nts-nonseat-bg: #e4e4ea;
+    --nts-nonseat-line: #b6b6c2;
+    --nts-scroll: #cfcfd8;
+    box-shadow: 0 12px 48px rgba(20, 20, 30, 0.18);
+  }
+}
+
+#nts-panel ::-webkit-scrollbar { width: 8px; height: 8px; }
+#nts-panel ::-webkit-scrollbar-thumb { background: var(--nts-scroll); border-radius: 4px; }
+#nts-panel ::-webkit-scrollbar-track { background: transparent; }
+
+/* Header */
+#nts-panel .nts-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  background: var(--nts-surface);
+  border-bottom: 1px solid var(--nts-border);
+}
+#nts-panel .nts-head > span:first-child {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+#nts-panel .nts-head > span:first-child::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--nts-accent);
+  box-shadow: 0 0 0 3px rgba(226, 0, 26, 0.15);
+}
+#nts-panel .nts-token {
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+#nts-panel .nts-token.nts-ok {
+  color: var(--nts-green-text);
+  background: var(--nts-green-bg);
+  border-color: rgba(111, 230, 161, 0.15);
+}
+#nts-panel .nts-token.nts-bad {
+  color: var(--nts-red-text);
+  background: var(--nts-red-bg);
+  border-color: rgba(255, 155, 155, 0.15);
+}
+#nts-panel .nts-collapse {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--nts-muted);
+  background: transparent;
+  border: 1px solid var(--nts-border-2);
+  border-radius: var(--nts-r-xs);
+  cursor: pointer;
+}
+#nts-panel .nts-collapse:hover { color: var(--nts-text); background: var(--nts-surface-2); }
+
+/* Body */
+#nts-panel .nts-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 14px;
+  overflow-y: auto;
+}
+#nts-panel.nts-min .nts-body { display: none; }
+
+#nts-panel .nts-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#nts-panel .nts-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--nts-muted);
+}
+
+/* Buttons */
+#nts-panel button {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--nts-text);
+  background: var(--nts-surface);
+  border: 1px solid var(--nts-border-2);
+  border-radius: var(--nts-r-sm);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+#nts-panel button:hover { background: var(--nts-surface-2); }
+#nts-panel button:disabled { opacity: 0.45; cursor: default; }
+#nts-panel .nts-start {
+  color: #eafff2;
+  background: var(--nts-green);
+  border-color: transparent;
+}
+#nts-panel .nts-start:hover:not(:disabled) { background: var(--nts-green-2); }
+#nts-panel .nts-stop {
+  color: #ffecec;
+  background: var(--nts-red);
+  border-color: transparent;
+}
+#nts-panel .nts-stop:hover:not(:disabled) { background: #d24a4a; }
+#nts-panel .nts-reload { margin-left: auto; }
+
+/* Icon / ghost buttons */
+#nts-panel .nts-refresh,
+#nts-panel .nts-seatbtn {
+  padding: 2px 7px;
+  font-size: 12px;
+  color: var(--nts-muted);
+  background: transparent;
+  border-color: var(--nts-border);
+}
+#nts-panel .nts-refresh:hover,
+#nts-panel .nts-seatbtn:hover { color: var(--nts-text); background: var(--nts-surface-2); }
+
+/* Inputs */
+#nts-panel select,
+#nts-panel input[type="number"] {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--nts-text);
+  background: var(--nts-surface);
+  border: 1px solid var(--nts-border-2);
+  border-radius: var(--nts-r-sm);
+  padding: 6px 8px;
+}
+#nts-panel select { flex: 1; min-width: 0; }
+#nts-panel input[type="number"] { width: 64px; }
+#nts-panel select:focus,
+#nts-panel input:focus {
+  outline: none;
+  border-color: var(--nts-accent);
+  box-shadow: 0 0 0 2px rgba(226, 0, 26, 0.18);
+}
+#nts-panel label { display: inline-flex; align-items: center; gap: 6px; color: var(--nts-muted); }
+
+/* Sections list */
+#nts-panel .nts-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--nts-surface);
+  border: 1px solid var(--nts-border);
+  border-radius: var(--nts-r-sm);
+}
+#nts-panel .nts-sec {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px 5px 8px;
+  border-radius: var(--nts-r-xs);
+  color: var(--nts-text);
+}
+#nts-panel .nts-sec:hover { background: var(--nts-surface-2); }
+#nts-panel .nts-sec.nts-sel { background: var(--nts-green-bg); color: var(--nts-green-text); font-weight: 600; }
+#nts-panel .nts-sec.nts-full { color: var(--nts-faint); }
+#nts-panel .nts-sec.nts-full.nts-sel { color: var(--nts-green-text); }
+#nts-panel .nts-sec-label { flex: 1; cursor: pointer; }
+#nts-panel .nts-seatbtn { flex: 0 0 auto; }
+
+/* Counter */
+#nts-panel .nts-counter {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--nts-green-text);
+  background: var(--nts-green-bg);
+  border: 1px solid rgba(111, 230, 161, 0.12);
+  border-radius: var(--nts-r-sm);
+  padding: 7px 10px;
+}
+
+#nts-panel .nts-counter.nts-idle {
+  color: var(--nts-muted);
+  background: var(--nts-surface);
+  border-color: var(--nts-border);
+}
+
+/* Verkoopwacht-modus: de stoel-specifieke controls doen hier niets, dus weg. */
+#nts-panel .nts-mode-label { color: var(--nts-muted); font-size: 12px; }
+#nts-panel input[type="radio"] { accent-color: var(--nts-green); margin: 0; }
+#nts-panel.nts-watchmode .nts-label,
+#nts-panel.nts-watchmode .nts-sections,
+#nts-panel.nts-watchmode .nts-countrow,
+#nts-panel.nts-watchmode .nts-reload { display: none; }
+
+/* Log */
+#nts-panel .nts-log {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--nts-muted);
+  background: var(--nts-code-bg);
+  border: 1px solid var(--nts-border);
+  border-radius: var(--nts-r-sm);
+  padding: 8px 10px;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#nts-panel .nts-log > div { padding: 1px 0; }
+
+/* Seat picker overlay */
+#nts-panel .nts-picker {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  flex-direction: column;
+  background: var(--nts-bg);
+}
+#nts-panel .nts-picker-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  background: var(--nts-surface);
+  border-bottom: 1px solid var(--nts-border);
+}
+#nts-panel .nts-picker-head > span:first-child { flex: 1; font-weight: 600; }
+#nts-panel .nts-picker-count { font-size: 11px; color: var(--nts-muted); }
+#nts-panel .nts-picker-head button { padding: 3px 9px; font-size: 12px; }
+#nts-panel .nts-picker-legend { font-size: 11px; color: var(--nts-muted); padding: 8px 14px 4px; }
+#nts-panel .nts-picker-grid { flex: 1; overflow: auto; padding: 6px 14px 14px; }
+#nts-panel .nts-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+}
+#nts-panel .nts-picker-rowlabel { flex: 0 0 46px; font-size: 10px; color: var(--nts-faint); }
+#nts-panel .nts-seat {
+  flex: 0 0 auto;
+  width: 21px;
+  height: 21px;
+  padding: 0;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--nts-muted);
+  background: var(--nts-surface-2);
+  border: 1px solid var(--nts-border-2);
+  border-radius: var(--nts-r-xs);
+  cursor: pointer;
+}
+#nts-panel .nts-seat:not(:disabled):hover { color: var(--nts-text); border-color: var(--nts-green-text); }
+#nts-panel .nts-seat.nts-seat-taken {
+  opacity: 0.4;
+  cursor: default;
+}
+#nts-panel .nts-seat.nts-seat-nonseat {
+  color: transparent;
+  cursor: default;
+  opacity: 1;
+  background-color: var(--nts-nonseat-bg);
+  border-color: var(--nts-border);
+  background-image:
+    linear-gradient(45deg, transparent 43%, var(--nts-nonseat-line) 43%, var(--nts-nonseat-line) 57%, transparent 57%),
+    linear-gradient(-45deg, transparent 43%, var(--nts-nonseat-line) 43%, var(--nts-nonseat-line) 57%, transparent 57%);
+}
+#nts-panel .nts-seat.nts-seat-chosen {
+  color: #fff;
+  background: var(--nts-green);
+  border-color: var(--nts-green);
+  opacity: 1;
+}
+
+/* Success banner (injected at the top of the page) */
+#nts-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 22px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(90deg, #1f9d55, #158043);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+#nts-banner button {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  color: #158043;
+  background: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+}

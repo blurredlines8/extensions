@@ -1,0 +1,8 @@
+{
+  "name": "seat-assist",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "web-ext": "^10.6.0"
+  }
+}

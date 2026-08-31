@@ -1,0 +1,21 @@
+# Lokale secrets — nooit delen
+.env
+
+# Build-output: gegenereerd door build.sh uit src/ + manifest.template.json,
+# met de shop-URL's uit .env ingevuld. Hoort niet in de repo.
+firefox-extension/content.js
+firefox-extension/styles.css
+firefox-extension/manifest.json
+chrome-extension/content.js
+chrome-extension/styles.css
+chrome-extension/manifest.json
+
+# Build-output en tooling
+dist/
+node_modules/
+firefox-extension/web-ext-artifacts/
+firefox-extension/.amo-upload-uuid
+
+# Documentatie blijft lokaal — noemt de doelomgeving bij naam
+AGENTS.md
+*/README.md

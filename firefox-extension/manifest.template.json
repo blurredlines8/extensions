@@ -1,0 +1,30 @@
+{
+  "manifest_version": 2,
+  "name": "Seat Assist",
+  "version": "1.0.0",
+  "description": "Monitort voorkeursvakken en zet zodra mogelijk een stoel in je winkelwagen. Draait binnen je ingelogde shop-sessie en pakt het token automatisch uit sessionStorage.",
+  "permissions": [
+    "__API_ORIGIN__/*",
+    "__SHOP_ORIGIN__/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "__SHOP_ORIGIN__/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "seat-assist@local",
+      "update_url": "https://raw.githubusercontent.com/blurredlines8/extensions/main/updates.json"
+    }
+  }
+}

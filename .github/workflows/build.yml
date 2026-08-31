@@ -1,0 +1,62 @@
+# Bij elke push naar main die de extensie zelf raakt: patch-versie ophogen,
+# bouwen en de pakketten als artifact bewaren.
+#
+# Deze workflow raakt AMO NOOIT. Signen is en blijft een bewuste handeling —
+# zie release.yml, die je zelf start.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - build.sh
+      - firefox-extension/manifest.template.json
+      - chrome-extension/manifest.template.json
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Alleen ophogen bij een echte push naar main; op een PR laten we de
+      # versie met rust (die branch is niet van ons om te herschrijven).
+      - name: Patch-versie ophogen
+        id: bump
+        if: github.event_name == 'push'
+        run: echo "version=$(node scripts/bump-version.mjs patch)" >> "$GITHUB_OUTPUT"
+
+      # De shop-URL's staan niet in de repo; build.sh vult ze in uit deze
+      # secrets en weigert te bouwen als ze ontbreken.
+      - name: Bouwen
+        env:
+          API_ORIGIN: ${{ secrets.API_ORIGIN }}
+          SHOP_ORIGIN: ${{ secrets.SHOP_ORIGIN }}
+        run: ./build.sh
+
+      - name: Versiebump terugcommitten
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firefox-extension/manifest.template.json chrome-extension/manifest.template.json
+          git commit -m "Versie $VERSION [skip ci]"
+          git push
+          # Let op: een push met GITHUB_TOKEN start zelf géén nieuwe workflow,
+          # dus dit kan niet in een lus terechtkomen.
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pakketten
+          path: |
+            dist/seat-assist-firefox.xpi
+            dist/seat-assist-chrome.zip
+          if-no-files-found: error

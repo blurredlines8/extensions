@@ -1,0 +1,102 @@
+# Signen + publiceren. Start deze workflow ZELF (Actions → Release → Run
+# workflow); dat handmatige startsein is de opt-in waar AGENTS.md om vraagt.
+# Niets aan een push mag AMO raken.
+#
+# Vereist twee repo-secrets: AMO_API_KEY en AMO_API_SECRET.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Versie ophogen vóór het signen"
+        type: choice
+        default: none
+        options: [none, patch, minor, major]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Controleren of de AMO-sleutels er zijn
+        env:
+          KEY: ${{ secrets.AMO_API_KEY }}
+          SECRET: ${{ secrets.AMO_API_SECRET }}
+        run: |
+          if [ -z "$KEY" ] || [ -z "$SECRET" ]; then
+            echo "✗ AMO_API_KEY/AMO_API_SECRET ontbreken als repo-secret."
+            echo "  Zet ze onder Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Versie bepalen
+        id: v
+        run: |
+          if [ "${{ inputs.bump }}" != "none" ]; then
+            VERSION=$(node scripts/bump-version.mjs "${{ inputs.bump }}")
+          else
+            VERSION=$(node scripts/bump-version.mjs --current)
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # AMO weigert een versie die al bestaat, en een bestaande tag zou de
+      # release laten mislukken ná het signen. Liever hier stuklopen.
+      - name: Vooraf checken dat de tag nog vrij is
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "✗ Release v$VERSION bestaat al. Kies een bump."
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - name: Bouwen en signen via AMO
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+          API_ORIGIN: ${{ secrets.API_ORIGIN }}
+          SHOP_ORIGIN: ${{ secrets.SHOP_ORIGIN }}
+          GH_REPO: ${{ github.repository }}
+        run: ./build.sh sign
+
+      - name: Release aanmaken
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" \
+            "dist/signed/seat-assist-firefox-$VERSION.xpi" \
+            "dist/seat-assist-chrome.zip" \
+            --title "v$VERSION" \
+            --notes "Gesigneerde Firefox-build en Chrome-pakket voor v$VERSION."
+
+      # build.sh sign schrijft updates.json met de download-URL van de release;
+      # die moet in de repo staan, want Firefox leest hem via de raw-URL.
+      - name: updates.json + versiebump committen
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add updates.json firefox-extension/manifest.template.json chrome-extension/manifest.template.json
+          # Zonder bump kan updates.json al kloppen; dan valt er niets te committen
+          # en dat mag de job niet alsnog laten falen.
+          if git diff --cached --quiet; then
+            echo "Niets gewijzigd — niets te committen."
+          else
+            git commit -m "Release $VERSION [skip ci]"
+            git push
+          fi
