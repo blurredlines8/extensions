@@ -275,6 +275,48 @@
 #nts-panel.nts-watchmode .nts-countrow,
 #nts-panel.nts-watchmode .nts-reload { display: none; }
 
+/* Verkoopwacht-statuskaart */
+#nts-panel .nts-watchcard:empty { display: none; }
+#nts-panel .nts-watchcard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 12px;
+  background: var(--nts-surface);
+  border: 1px solid var(--nts-border);
+  border-radius: var(--nts-r-sm);
+}
+#nts-panel .nts-wc-title { font-weight: 600; font-size: 13px; }
+#nts-panel .nts-wc-status { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+#nts-panel .nts-wc-badge {
+  font-size: 13px; font-weight: 700; letter-spacing: 0.2px;
+  color: var(--nts-muted);
+}
+#nts-panel .nts-wc-open .nts-wc-badge { color: var(--nts-green-text); }
+#nts-panel .nts-wc-count { font-size: 12px; color: var(--nts-text); font-variant-numeric: tabular-nums; }
+#nts-panel .nts-wc-button {
+  font-size: 12px; color: var(--nts-text);
+  background: var(--nts-code-bg); border-radius: var(--nts-r-xs);
+  padding: 5px 8px;
+}
+#nts-panel .nts-wc-when { font-size: 11px; color: var(--nts-faint); }
+#nts-panel .nts-wc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px; }
+#nts-panel .nts-wc-cell {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  border-bottom: 1px solid var(--nts-border); padding-bottom: 3px;
+}
+#nts-panel .nts-wc-k { font-size: 11px; color: var(--nts-muted); }
+#nts-panel .nts-wc-v { font-size: 12px; font-variant-numeric: tabular-nums; }
+#nts-panel .nts-wc-strong .nts-wc-v { color: var(--nts-green-text); font-weight: 700; }
+#nts-panel .nts-wc-flags { display: flex; flex-wrap: wrap; gap: 4px; }
+#nts-panel .nts-wc-flag {
+  font-size: 10.5px; padding: 2px 6px; border-radius: 999px;
+  border: 1px solid var(--nts-border-2); color: var(--nts-muted);
+}
+#nts-panel .nts-wc-ja { color: var(--nts-green-text); border-color: rgba(111, 230, 161, 0.3); }
+#nts-panel .nts-wc-nee { color: var(--nts-faint); }
+#nts-panel .nts-wc-foot { font-size: 10.5px; color: var(--nts-faint); }
+
 /* Log */
 #nts-panel .nts-log {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

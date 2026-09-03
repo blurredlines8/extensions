@@ -519,19 +519,116 @@
     });
     const tiers = [...byPrice.entries()].sort((a, b) => a[0] - b[0])
       .map(([prijs, n]) => n + '× €' + prijs.toFixed(2));
+    const secs = (venue && venue.Sections) || [];
+    const available = secs.reduce((a, x) => {
+      const n = countFromSection(x);
+      return a + (n || 0);
+    }, 0);
     return {
-      sections: (venue && venue.Sections ? venue.Sections.length : 0),
+      sections: secs.length,
+      available: secs.length ? available : null,
       placements: epf.length,
       priced: [...byPrice.values()].reduce((a, b) => a + b, 0),
       tiers: tiers.join(' · ') || '—',
     };
   }
 
+  // De API stuurt naïeve tijdstempels zonder zone. Dat ze UTC zijn blijkt uit de
+  // knop zelf: ActiveTill 2026-09-03T10:00:00 hoort bij knoptekst "03-09, 12:00
+  // uur" — precies het CEST-verschil. We tonen daarom lokale tijd én de ruwe
+  // waarde, zodat een verkeerde aanname meteen opvalt.
+  const asUtcDate = v => {
+    if (!v || typeof v !== 'string') return null;
+    const d = new Date(/[Z+]|-\d\d:\d\d$/.test(v) ? v : v + 'Z');
+    return isNaN(d.getTime()) ? null : d;
+  };
+  const fmtLocal = d => d.toLocaleString('nl-NL',
+    { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  function fmtDuration(ms) {
+    if (ms < 0) return null;
+    const s = Math.floor(ms / 1000);
+    const u = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return (u ? u + 'u ' : '') + (u || m ? m + 'm ' : '') + sec + 's';
+  }
+  const jaNee = v => (v === true ? 'ja' : v === false ? 'nee' : '—');
+
   const snapshot = ev => {
     const s = {};
     WATCH_FIELDS.forEach(([path]) => { s[path] = showVal(pick(ev, path)); });
     return s;
   };
+
+  // Bouwt de statuskaart. Alles wat je in één oogopslag wilt zien staat hier;
+  // het log houdt alleen nog wijzigingen bij.
+  function renderWatchCard(ev, vs) {
+    const card = ui.watchCard;
+    card.innerHTML = '';
+    const open = isOnSale(ev);
+    const till = asUtcDate(pick(ev, 'ButtonData.ActiveTill'));
+    state.watch.opensAt = open ? null : till;
+
+    const el = (tag, cls, text) => {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = text;
+      return n;
+    };
+    const kickoff = asUtcDate(ev.EventStartDateTime);
+    card.appendChild(el('div', 'nts-wc-title',
+      ev.Name + (kickoff ? ' · ' + fmtLocal(kickoff) : '')));
+
+    const status = el('div', 'nts-wc-status' + (open ? ' nts-wc-open' : ''));
+    status.appendChild(el('span', 'nts-wc-badge', open ? '🎉 IN VERKOOP' : '⏳ Nog dicht'));
+    ui.watchCountdown = el('span', 'nts-wc-count', '');
+    status.appendChild(ui.watchCountdown);
+    card.appendChild(status);
+
+    card.appendChild(el('div', 'nts-wc-button', showVal(pick(ev, 'ButtonData.TranslationCode'))));
+    if (till && !open) {
+      card.appendChild(el('div', 'nts-wc-when',
+        'omslag ' + fmtLocal(till) + '  (API: ' + pick(ev, 'ButtonData.ActiveTill') + ' UTC)'));
+    }
+
+    // Cijfers uit Venue/venue
+    const grid = el('div', 'nts-wc-grid');
+    const cel = (label, waarde, sterk) => {
+      const c = el('div', 'nts-wc-cell' + (sterk ? ' nts-wc-strong' : ''));
+      c.appendChild(el('span', 'nts-wc-k', label));
+      c.appendChild(el('span', 'nts-wc-v', waarde));
+      grid.appendChild(c);
+    };
+    cel('vakken', vs ? String(vs.sections) : '—', vs && vs.sections > 0);
+    cel('kaarten vrij', vs && vs.available != null ? String(vs.available) : '—', !!(vs && vs.available));
+    cel('plaatsen', vs ? String(vs.placements) : '—');
+    cel('prijzen', vs ? vs.tiers : '—');
+    card.appendChild(grid);
+
+    // Vlaggen, compact en in gewone taal
+    const flags = el('div', 'nts-wc-flags');
+    [['verkoop voor jou', ev.CurrentlyOnSaleForUser],
+     ['vrije verkoop', ev.HasGeneralSale],
+     ['kaarten aanwezig', ev.HasTicketsAvailable],
+     ['uitverkocht', ev.HasSoldOut],
+     ['kooprecht na login', ev.PurchaseRightAvailableAfterLogin],
+     ['verkoopflow toegestaan', ev.SalesFlowAllowed]].forEach(([k, v]) => {
+      const f = el('span', 'nts-wc-flag nts-wc-' + (v === true ? 'ja' : v === false ? 'nee' : 'onb'));
+      f.textContent = k + ': ' + jaNee(v);
+      flags.appendChild(f);
+    });
+    card.appendChild(flags);
+
+    card.appendChild(el('div', 'nts-wc-foot', 'laatste check ' + nowStr()));
+    updateCountdown();
+  }
+
+  // Loopt elke seconde zodat de aftelling niet 30s stilstaat.
+  function updateCountdown() {
+    if (!ui.watchCountdown) return;
+    const at = state.watch.opensAt;
+    if (!at) { ui.watchCountdown.textContent = ''; return; }
+    const d = fmtDuration(at.getTime() - Date.now());
+    ui.watchCountdown.textContent = d ? 'opent over ' + d : 'omslagmoment verstreken';
+  }
 
   async function watchTick() {
     if (!getToken()) { log('⚠️ Geen token in sessionStorage — ben je ingelogd?'); return; }
@@ -549,9 +646,8 @@
     const prev = state.watch.prev;
     state.watch.prev = now;
 
-    if (!prev) {
-      log('👀 Beginstand: ' + WATCH_FIELDS.map(([p, l]) => l + '=' + now[p]).join(' · '));
-    } else {
+    // De beginstand staat in de kaart hierboven; het log is er voor wijzigingen.
+    if (prev) {
       WATCH_FIELDS.forEach(([p, label]) => {
         if (prev[p] !== now[p]) log('🔔 ' + label + ': ' + prev[p] + ' → ' + now[p]);
       });
@@ -566,10 +662,9 @@
 
     if (vs) {
       const pv = state.watch.prevVenue;
-      if (!pv) {
-        log('🗺️ ' + vs.sections + ' vak(ken) · ' + vs.placements + ' plaatsen · prijzen: ' + vs.tiers);
-      } else {
+      if (pv) {
         if (pv.sections !== vs.sections) log('🗺️ vakken: ' + pv.sections + ' → ' + vs.sections);
+        if (pv.available !== vs.available) log('🎫 kaarten vrij: ' + showVal(pv.available) + ' → ' + showVal(vs.available));
         if (pv.priced !== vs.priced) log('💶 plaatsen met prijs: ' + pv.priced + ' → ' + vs.priced + ' (' + vs.tiers + ')');
         if (pv.placements !== vs.placements) log('🗺️ plaatsen: ' + pv.placements + ' → ' + vs.placements);
       }
@@ -582,14 +677,8 @@
       state.watch.prevVenue = vs;
     }
 
+    renderWatchCard(ev, vs);
     const open = isOnSale(ev);
-    const till = pick(ev, 'ButtonData.ActiveTill');
-    ui.counter.textContent = (open ? '🎉 IN VERKOOP' : 'Nog dicht') +
-      ' · knop: ' + showVal(pick(ev, 'ButtonData.TranslationCode')) +
-      (till && !open ? ' (tot ' + till.replace('T', ' ') + ')' : '') +
-      (vs ? ' · ' + vs.sections + ' vak / ' + vs.tiers : '') +
-      ' · gecheckt ' + nowStr();
-    ui.counter.classList.toggle('nts-idle', !open);
 
     if (needsLogin(ev) && !state.watch.loginWarned) {
       state.watch.loginWarned = true;
@@ -646,6 +735,7 @@
     setRunning(true);
     watchTick();
     state.watch.timer = setInterval(watchTick, WATCH_INTERVAL_MS);
+    state.watch.tick1s = setInterval(updateCountdown, 1000);
   }
 
   function startSeats() {
@@ -683,6 +773,7 @@
   function stop() {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
     if (state.watch.timer) { clearInterval(state.watch.timer); state.watch.timer = null; }
+    if (state.watch.tick1s) { clearInterval(state.watch.tick1s); state.watch.tick1s = null; }
     restoreTitle();
     setRunning(false);
   }
@@ -702,8 +793,9 @@
     ui.modeSeats.checked = mode === 'seats';
     ui.modeWatch.checked = mode === 'watch';
     ui.panel.classList.toggle('nts-watchmode', mode === 'watch');
-    ui.counter.textContent = mode === 'watch' ? 'Verkoopwacht: niet gestart' : 'Vrij nu: —';
-    ui.counter.classList.toggle('nts-idle', mode === 'watch');
+    ui.counter.textContent = 'Vrij nu: —';
+    ui.counter.classList.remove('nts-idle');
+    if (mode !== 'watch') ui.watchCard.innerHTML = '';
   }
 
   function onSuccess() {
@@ -974,6 +1066,7 @@
       '  <div class="nts-sections"></div>',
       '  <div class="nts-row nts-countrow"><label>Aantal stoelen: <input type="number" class="nts-count" min="1" value="1"></label></div>',
       '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>',
+      '  <div class="nts-watchcard"></div>',
       '  <div class="nts-counter">Vrij nu: —</div>',
       '  <div class="nts-log"></div>',
       '</div>',
@@ -992,6 +1085,7 @@
     ui.stopBtn = panel.querySelector('.nts-stop');
     ui.reloadBtn = panel.querySelector('.nts-reload');
     ui.counter = panel.querySelector('.nts-counter');
+    ui.watchCard = panel.querySelector('.nts-watchcard');
     ui.refresh = panel.querySelector('.nts-refresh');
     ui.picker = panel.querySelector('.nts-picker');
     ui.log = panel.querySelector('.nts-log');
