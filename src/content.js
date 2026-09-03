@@ -28,6 +28,7 @@
     evRecord: null,            // most recently fetched event record
     evFetched: 0,
     right: null,               // this customer's purchase right for the event (or null)
+    session: { wasCustomer: false, lastRefresh: 0 },
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -190,6 +191,32 @@
       log('  select-position error: ' + e.message);
       return 'error';
     }
+  }
+
+  // Renew the shop session. The shop-JWT in sessionStorage lives 24h; this
+  // endpoint (the one the shop itself calls after linking friends) returns a
+  // fresh JWT good for another 24h. The API does not enforce the SSO tokens
+  // embedded in it (verified: a JWT kept working 8h after its inner access
+  // token expired), so this alone keeps the session alive.
+  //
+  // Not to be confused with the ShopGuard/queue token refresh — that is the
+  // waiting room and we do not touch it.
+  async function refreshSession() {
+    const res = await fetch(API + '/v2/Account/token/managed-customerids/refresh', {
+      credentials: 'omit', headers: headers(),
+    });
+    if (!res.ok) throw new Error('refresh HTTP ' + res.status);
+    const data = await res.json();
+    if (!data || !data.Token) throw new Error('refresh: no Token (' + (data && data.AuthResult) + ')');
+    return data.Token;
+  }
+
+  // Decode the JWT payload without verifying it; we only need type and expiry.
+  function decodeJwt(tok) {
+    try {
+      const p = tok.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(p + '='.repeat((4 - p.length % 4) % 4)));
+    } catch (e) { return null; }
   }
 
   // How many tickets this customer may buy for the event. A PUT, but it only
@@ -1188,10 +1215,53 @@
     }
   }
 
+  // Show what the token actually is, not just that one exists. The shop swaps
+  // in an anonymous token when its own login check fails (route guard →
+  // ensureAnonymousToken), which is what "suddenly logged out" looks like; a
+  // Customer → Anonymous flip is worth an explicit warning.
   function refreshTokenStatus() {
-    const ok = !!getToken();
-    ui.token.textContent = ok ? 'token: gevonden ✓' : 'token: niet gevonden — log in';
-    ui.token.className = 'nts-token' + (ok ? ' nts-ok' : ' nts-bad');
+    const tok = getToken();
+    const c = tok && decodeJwt(tok);
+    if (!c) {
+      ui.token.textContent = 'token: niet gevonden — log in';
+      ui.token.className = 'nts-token nts-bad';
+      return;
+    }
+    const customer = c.type === 'Customer';
+    const left = c.exp ? c.exp * 1000 - Date.now() : null;
+    const leftTxt = left == null ? '' : ' · ' + (left > 0 ? fmtDuration(left) + ' geldig' : 'VERLOPEN');
+    ui.token.textContent = (customer ? 'ingelogd' : 'anoniem') + leftTxt;
+    ui.token.className = 'nts-token' + (customer && left > 0 ? ' nts-ok' : ' nts-bad');
+
+    if (state.session.wasCustomer && !customer) {
+      log('🔒 Je sessie is teruggevallen naar anoniem — log opnieuw in. ' +
+          '(De shop doet dit zelf zodra zijn login-check faalt.)');
+      beep();
+    }
+    state.session.wasCustomer = customer;
+  }
+
+  // Renew well before the 24h expiry. Every 6h is plenty; the shop only ever
+  // renews on login, so this is strictly extra. Only for a Customer token —
+  // renewing an anonymous one gains nothing.
+  const SESSION_REFRESH_MS = 6 * 3600 * 1000;
+  async function keepSessionAlive() {
+    const tok = getToken();
+    const c = tok && decodeJwt(tok);
+    if (!c || c.type !== 'Customer') return;
+    const left = c.exp ? c.exp * 1000 - Date.now() : Infinity;
+    if (left > SESSION_REFRESH_MS && Date.now() - state.session.lastRefresh < SESSION_REFRESH_MS) return;
+    try {
+      const fresh = await refreshSession();
+      const fc = decodeJwt(fresh);
+      if (!fc || fc.type !== 'Customer') throw new Error('refresh gaf geen klant-token');
+      window.sessionStorage.setItem('jwt', fresh);
+      state.session.lastRefresh = Date.now();
+      log('🔄 Sessie verlengd tot ' + fmtLocal(new Date(fc.exp * 1000)));
+      refreshTokenStatus();
+    } catch (e) {
+      log('⚠️ Sessie verlengen mislukt: ' + e.message);
+    }
   }
 
   function showBanner(text, label, url) {
@@ -1291,6 +1361,9 @@
 
     refreshTokenStatus();
     setInterval(refreshTokenStatus, 3000);
+    // Session keep-alive: check every 10 minutes, act when it is time.
+    keepSessionAlive();
+    setInterval(keepSessionAlive, 10 * 60 * 1000);
     setInterval(updateCountdown, 1000);
     log('Klaar. Zorg dat je ingelogd bent en door de wachtrij, klik "Events laden".');
     restoreCart();
