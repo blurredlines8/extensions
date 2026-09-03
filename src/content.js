@@ -1257,6 +1257,14 @@
       if (!fc || fc.type !== 'Customer') throw new Error('refresh gaf geen klant-token');
       window.sessionStorage.setItem('jwt', fresh);
       state.session.lastRefresh = Date.now();
+      // The shop's own refresh also re-fetches Account/current into
+      // sessionStorage.userData. Its login check reads that cache first, and
+      // falls back to an anonymous token when a live check fails — so keeping
+      // userData present is what actually prevents the "sudden logout".
+      try {
+        const res = await fetch(API + '/v2/Account/current', { credentials: 'omit', headers: headers() });
+        if (res.ok) window.sessionStorage.setItem('userData', JSON.stringify(await res.json()));
+      } catch (e) { /* the jwt is renewed regardless */ }
       log('🔄 Sessie verlengd tot ' + fmtLocal(new Date(fc.exp * 1000)));
       refreshTokenStatus();
     } catch (e) {
