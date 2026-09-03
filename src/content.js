@@ -517,8 +517,8 @@
       if (x.BasePrice == null) return;
       byPrice.set(x.BasePrice, (byPrice.get(x.BasePrice) || 0) + 1);
     });
-    const tiers = [...byPrice.entries()].sort((a, b) => a[0] - b[0])
-      .map(([prijs, n]) => n + '× €' + prijs.toFixed(2));
+    const prices = [...byPrice.entries()].sort((a, b) => a[0] - b[0]);
+    const tiers = prices.map(([prijs, n]) => n + '× €' + prijs.toFixed(2));
     const secs = (venue && venue.Sections) || [];
     const available = secs.reduce((a, x) => {
       const n = countFromSection(x);
@@ -529,6 +529,7 @@
       available: secs.length ? available : null,
       placements: epf.length,
       priced: [...byPrice.values()].reduce((a, b) => a + b, 0),
+      prices,
       tiers: tiers.join(' · ') || '—',
     };
   }
@@ -544,11 +545,17 @@
   };
   const fmtLocal = d => d.toLocaleString('nl-NL',
     { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  // Grofheid meeschalen met de afstand: seconden zijn ruis op tien dagen, en
+  // "244u" leest niemand.
   function fmtDuration(ms) {
     if (ms < 0) return null;
     const s = Math.floor(ms / 1000);
-    const u = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-    return (u ? u + 'u ' : '') + (u || m ? m + 'm ' : '') + sec + 's';
+    const d = Math.floor(s / 86400), u = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60), sec = s % 60;
+    if (d > 0) return d + 'd ' + u + 'u';
+    if (s >= 3600) return u + 'u ' + m + 'm';
+    if (s >= 600) return m + 'm';
+    return (m ? m + 'm ' : '') + sec + 's';
   }
   const jaNee = v => (v === true ? 'ja' : v === false ? 'nee' : '—');
 
@@ -558,14 +565,36 @@
     return s;
   };
 
-  // Bouwt de statuskaart. Alles wat je in één oogopslag wilt zien staat hier;
-  // het log houdt alleen nog wijzigingen bij.
+  // Wat de shop-knop betekent, in gewone taal. De BTN.SALE.*-codes zijn de
+  // standaardknop; een eigen clublabel tonen we ongewijzigd, dat zegt meer.
+  const STATUS_TEXT = {
+    'BTN.SALE.SOLDOUT': 'Uitverkocht',
+    'BTN.SALE.BUYNOW': 'In verkoop',
+    'BTN.SALE.LOGINTOBUY': 'Inloggen om te kopen',
+    'BTN.SALE.NOTONSALE': 'Niet in verkoop voor jou',
+  };
+
+  // Lange prijslijsten inkorten tot een bereik; zes staffels achter elkaar
+  // vullen de halve kaart en zeggen niet meer dan "van … tot …".
+  function priceLabel(vs) {
+    if (!vs || !vs.prices || !vs.prices.length) return null;
+    const p = vs.prices;
+    if (p.length <= 2) return p.map(([prijs, n]) => n + '× €' + prijs.toFixed(2)).join(' · ');
+    const lo = p[0][0], hi = p[p.length - 1][0];
+    return '€' + lo.toFixed(2) + ' – €' + hi.toFixed(2) + ' (' + p.length + " staffels)";
+  }
+
   function renderWatchCard(ev, vs) {
     const card = ui.watchCard;
     card.innerHTML = '';
     const open = isOnSale(ev);
     const till = asUtcDate(pick(ev, 'ButtonData.ActiveTill'));
-    state.watch.opensAt = open ? null : till;
+    // Valt het einde van de knop samen met de aftrap, dan is het een
+    // placeholder ("Info volgt") en geen verkoopmoment — dan niet aftellen,
+    // anders suggereren we een openingstijd die nergens op slaat.
+    const kick = asUtcDate(ev.EventStartDateTime);
+    const isPlaceholder = !!(till && kick && till.getTime() === kick.getTime());
+    state.watch.opensAt = (open || isPlaceholder) ? null : till;
 
     const el = (tag, cls, text) => {
       const n = document.createElement(tag);
@@ -577,45 +606,52 @@
     card.appendChild(el('div', 'nts-wc-title',
       ev.Name + (kickoff ? ' · ' + fmtLocal(kickoff) : '')));
 
+    // Eén statusregel. Staat er een aftelling, dan is dát de kop; anders de
+    // betekenis van de knop.
+    const code = buttonCode(ev);
+    const label = pick(ev, 'ButtonData.TranslationCode');
     const status = el('div', 'nts-wc-status' + (open ? ' nts-wc-open' : ''));
-    status.appendChild(el('span', 'nts-wc-badge', open ? '🎉 IN VERKOOP' : '⏳ Nog dicht'));
     ui.watchCountdown = el('span', 'nts-wc-count', '');
+    status.appendChild(el('span', 'nts-wc-badge',
+      STATUS_TEXT[code] || (open ? 'In verkoop' : 'Nog dicht')));
     status.appendChild(ui.watchCountdown);
     card.appendChild(status);
 
-    card.appendChild(el('div', 'nts-wc-button', showVal(pick(ev, 'ButtonData.TranslationCode'))));
-    if (till && !open) {
-      card.appendChild(el('div', 'nts-wc-when',
-        'omslag ' + fmtLocal(till) + '  (API: ' + pick(ev, 'ButtonData.ActiveTill') + ' UTC)'));
+    // Het eigen label van de club alleen tonen als het iets toevoegt.
+    if (label && !STATUS_TEXT[label]) {
+      const b = el('div', 'nts-wc-button', label);
+      if (till) b.title = 'omslag ' + fmtLocal(till) + '  (API: ' +
+        pick(ev, 'ButtonData.ActiveTill') + ' UTC)';
+      card.appendChild(b);
     }
 
-    // Cijfers uit Venue/venue
-    const grid = el('div', 'nts-wc-grid');
-    const cel = (label, waarde, sterk) => {
-      const c = el('div', 'nts-wc-cell' + (sterk ? ' nts-wc-strong' : ''));
-      c.appendChild(el('span', 'nts-wc-k', label));
-      c.appendChild(el('span', 'nts-wc-v', waarde));
-      grid.appendChild(c);
-    };
-    cel('vakken', vs ? String(vs.sections) : '—', vs && vs.sections > 0);
-    cel('kaarten vrij', vs && vs.available != null ? String(vs.available) : '—', !!(vs && vs.available));
-    cel('plaatsen', vs ? String(vs.placements) : '—');
-    cel('prijzen', vs ? vs.tiers : '—');
-    card.appendChild(grid);
+    // Eén cijferregel. "plaatsen" laten we weg: dat zijn prijscategorieën,
+    // geen kaarten, en het wekte juist de indruk dat er 31 kaarten waren.
+    const delen = [];
+    if (vs) {
+      delen.push(vs.sections + ' vak' + (vs.sections === 1 ? '' : 'ken'));
+      delen.push(vs.available == null ? 'nog geen kaarten' : vs.available + ' vrij');
+      const pr = priceLabel(vs);
+      if (pr) delen.push(pr);
+    }
+    if (delen.length) {
+      const m = el('div', 'nts-wc-metrics');
+      m.appendChild(el('span', 'nts-wc-m' + (vs.available ? ' nts-wc-strong' : ''), delen[0] + ' · ' + delen[1]));
+      if (delen[2]) m.appendChild(el('span', 'nts-wc-m nts-wc-dim', delen[2]));
+      card.appendChild(m);
+    }
 
-    // Vlaggen, compact en in gewone taal
-    const flags = el('div', 'nts-wc-flags');
-    [['verkoop voor jou', ev.CurrentlyOnSaleForUser],
-     ['vrije verkoop', ev.HasGeneralSale],
-     ['kaarten aanwezig', ev.HasTicketsAvailable],
-     ['uitverkocht', ev.HasSoldOut],
-     ['kooprecht na login', ev.PurchaseRightAvailableAfterLogin],
-     ['verkoopflow toegestaan', ev.SalesFlowAllowed]].forEach(([k, v]) => {
-      const f = el('span', 'nts-wc-flag nts-wc-' + (v === true ? 'ja' : v === false ? 'nee' : 'onb'));
-      f.textContent = k + ': ' + jaNee(v);
-      flags.appendChild(f);
-    });
-    card.appendChild(flags);
+    // Alleen vlaggen die iets betekenen. "nee" op zes rijen is ruis.
+    const bijzonder = [];
+    if (ev.PurchaseRightAvailableAfterLogin === true) bijzonder.push('kooprecht na inloggen');
+    if (ev.HasSoldOut === true) bijzonder.push('uitverkocht');
+    if (ev.HasMarketplaceTicketsAvailable === true) bijzonder.push('marktplaats');
+    if (ev.SalesFlowAllowed === false) bijzonder.push('verkoopflow geblokkeerd');
+    if (bijzonder.length) {
+      const f = el('div', 'nts-wc-flags');
+      bijzonder.forEach(t => f.appendChild(el('span', 'nts-wc-flag', t)));
+      card.appendChild(f);
+    }
 
     card.appendChild(el('div', 'nts-wc-foot', 'laatste check ' + nowStr()));
     updateCountdown();
