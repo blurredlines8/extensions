@@ -7,9 +7,10 @@
   const INTERVAL_MS = 5000;
   const CART_URL = '__SHOP_ORIGIN__/shopping-cart';
   const SHOP_URL = '__SHOP_ORIGIN__/';
-  // De verkoopwacht pollt alleen /v2/Event en kan dagen lopen; 30s is ruim
-  // snel genoeg voor "gaat in verkoop" en houdt het verkeer bescheiden.
-  const WATCH_INTERVAL_MS = 30000;
+  // Zolang er nog geen vakken zijn hoeft de monitor niet op volle snelheid;
+  // dat wachten kan dagen duren. Ook het event-record wordt op dit ritme
+  // ververst, want dat verandert traag.
+  const WAIT_INTERVAL_MS = 30000;
 
   const state = {
     events: [],
@@ -20,10 +21,12 @@
     desiredSeats: {},      // vbbId -> Set of specific seat Ids (empty = first available)
     wantedCount: 1,
     timer: null,
-    mode: 'seats',         // 'seats' = stoelenscan, 'watch' = verkoopwacht
-    modeAuto: false,       // modus is automatisch gezet (mag automatisch terug)
     watch: { timer: null, prev: null, alerted: false, title: null },
     unplacedSeen: new Set(),   // vakken waarvan we de unplaced-vorm al logden
+    lastSections: 0,           // aantal vakken bij de vorige ronde
+    lastPoll: 0,               // tijdstip van de vorige ronde (voor de wachtstand)
+    evRecord: null,            // laatst opgehaalde event-record
+    evFetched: 0,
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -62,7 +65,7 @@
   const isSeat = c => c.PlacementTypeId === 1;
 
   // ------------------------------------------------------------------ API ---
-  // Rauwe event-records: de verkoopwacht kijkt naar velden die de mapping
+  // Rauwe event-records: de statuskaart kijkt naar velden die de mapping
   // hieronder weggooit (ButtonData, OnGeneralSaleFrom, …).
   async function getEventsRaw() {
     const res = await fetch(API + '/v2/Event', { credentials: 'omit', headers: headers() });
@@ -187,6 +190,53 @@
       return 'unavailable';
     } catch (e) {
       log('  select-position error: ' + e.message);
+      return 'error';
+    }
+  }
+
+  // Een plek kopen in een vak zonder stoelnummers. Payload afgeleid uit de
+  // shop-bundle (addUnplacedTickets → unplaced-event-selection): één aanroep
+  // pakt meteen `amount` plekken, anders dan bij stoelen waar we per stoel
+  // langsgaan. Retourneert 'ok' | 'unavailable' | 'error', net als claimSeat.
+  //
+  // LET OP: deze aanroep is afgeleid uit hun JavaScript, niet in het echt
+  // waargenomen. De eerste keer dat hij vuurt is meteen menens.
+  async function claimUnplaced(section, amount) {
+    const body = {
+      PendingReservationId: state.cart.reservationId,
+      PendingReservationUID: state.cart.reservationUID,
+      Amount: amount,
+      MarketplacePrices: null,
+      AllowAutoSelect: false,
+      ParentVenueBuildingBlockId: section.VenueBuildingBlockId,
+      EventIds: [state.eventId],
+      InitiativeGuid: getInitiativeGuid(),
+    };
+    const post = () => fetch(API + '/v2/PendingReservation/unplaced-event-selection', {
+      method: 'POST', credentials: 'omit', headers: headers(), body: JSON.stringify(body),
+    });
+    try {
+      let res = await post();
+      if (!res.ok) { log('  unplaced-event-selection HTTP ' + res.status); return 'error'; }
+      let data = await res.json();
+
+      // Zelfde tweede poging als bij stoelen; de shop doet het ook zo.
+      if (data.ResultCode === 'MultiSelectRequired' || data.ResultCode === 'BundleRequired') {
+        body.AllowAutoSelect = true;
+        res = await post();
+        if (!res.ok) { log('  unplaced (auto-select) HTTP ' + res.status); return 'error'; }
+        data = await res.json();
+      }
+
+      if (data.ResultCode === 'OK' && data.UpdatedPendingReservation) {
+        state.cart.reservationId = data.UpdatedPendingReservation.PendingReservationId;
+        state.cart.reservationUID = data.UpdatedPendingReservation.PendingReservationUID;
+        return 'ok';
+      }
+      log('  ✗ Niet gelukt (' + (data.ResultCode || 'onbekend') + ')');
+      return 'unavailable';
+    } catch (e) {
+      log('  unplaced-event-selection error: ' + e.message);
       return 'error';
     }
   }
@@ -338,12 +388,38 @@
   }
 
   // -------------------------------------------------------------- monitor ---
+  // Eén monitor voor beide soorten events; wat voor event het is leiden we af
+  // uit de plattegrond zelf:
+  //
+  //   geen vakken        → er valt nog niets te halen, we blijven kijken
+  //   vak mét rijen      → thuiswedstrijd: kies een stoel
+  //   vak zónder rijen   → uitwedstrijd: koop een plek in dat vak
+  //
+  // Dat is precies de regel die de shop zelf ook hanteert (geen Rows = unplaced).
   async function tick() {
     if (state.cart.done || state.reloading) return;
     if (!getToken()) { log('⚠️ Geen token in sessionStorage — ben je ingelogd?'); return; }
 
+    // In de wachtstand (nog geen vakken) hoeft het niet elke 5 seconden; dat kan
+    // dagen duren. Zodra er vakken zijn, gaan we op volle snelheid.
+    const nu = Date.now();
+    if (state.lastSections === 0 && state.lastPoll && nu - state.lastPoll < WAIT_INTERVAL_MS) return;
+    state.lastPoll = nu;
+
     try {
+      // Het event-record verandert traag; niet bij elke ronde ophalen.
+      if (!state.evRecord || nu - state.evFetched > WAIT_INTERVAL_MS) {
+        const vers = (await getEventsRaw()).find(i => i.EventId === state.eventId);
+        if (vers) { reportEventChanges(vers); state.evRecord = vers; }
+        state.evFetched = nu;
+      }
+
       const venue = await getVenue(state.eventId);
+      const vs = summarisePlacements(venue);
+      if (state.evRecord) renderWatchCard(state.evRecord, vs);
+      reportVenueChanges(vs);
+      state.lastSections = vs.sections;
+
       const isAvail = s =>
         s.SaleCategoryId === state.eventCategory &&
         (s.HasTicketsAvailable === true || s.HasMarketplaceTicketsAvailable === true);
@@ -359,31 +435,31 @@
         secs = venue.Sections.filter(isAvail);
       }
 
-      // One fetch per section, reused for both the counter and the claim pass.
+      if (!secs.length) {
+        ui.counter.textContent = vs.sections
+          ? 'Nog niets vrij in je voorkeursvak(ken) · ' + nowStr()
+          : 'Wachten op vakken · gecontroleerd ' + nowStr();
+        return;
+      }
+
+      // Eén fetch per vak, hergebruikt voor zowel de teller als de koopronde.
       const gathered = [];
       const currentKeys = new Set();
       for (const section of secs) {
         const detail = await getSection(section.VenueBuildingBlockId, state.eventId);
 
-        // Uitvakken/staanplaatsen leveren geen Rows. Vroeger liep tick() daar
-        // stuk op detail.Rows.flatMap; nu tonen we het aantal los.
         if (isUnplacedDetail(detail)) {
-          let u = null;
-          try { u = await getSectionUnplaced(section.VenueBuildingBlockId, state.eventId); }
-          catch (e) { log('  section-unplaced ' + section.Name + ': ' + e.message); }
-          const n = countUnplaced(u) ?? countFromSection(section);
+          let n = countFromSection(section);
+          if (n === null) {
+            try { n = countUnplaced(await getSectionUnplaced(section.VenueBuildingBlockId, state.eventId)); }
+            catch (e) { log('  section-unplaced ' + section.Name + ': ' + e.message); }
+          }
           if (!state.unplacedSeen.has(section.VenueBuildingBlockId)) {
             state.unplacedSeen.add(section.VenueBuildingBlockId);
-            // Eén keer de ruwe vorm loggen: die hebben we nog nooit gevuld gezien.
             log('🎫 ' + section.Name + ' is een vak zonder stoelnummers · ' +
-                (n === null ? 'aantal onbekend' : n + ' beschikbaar'));
-            if (u) log('   ruwe data: ' + JSON.stringify({
-              Availability: u.Availability,
-              TicketsPerTicketTypeId: u.Details && u.Details.TicketsPerTicketTypeId,
-              HasTicketsAvailable: u.Details && u.Details.HasTicketsAvailable,
-            }).slice(0, 400));
+                (n === null ? 'aantal onbekend' : n + ' plek(ken) vrij'));
           }
-          gathered.push({ section, seats: [], unplaced: n });
+          gathered.push({ section, seats: [], plekken: n });
           continue;
         }
 
@@ -394,50 +470,74 @@
         for (const c of seats) currentKeys.add(section.VenueBuildingBlockId + ':' + c.Id);
       }
 
-      const unplacedTotal = gathered.reduce((a, g) => a + (g.unplaced || 0), 0);
-      if (unplacedTotal) log('🎫 Zonder stoelnummer beschikbaar: ' + unplacedTotal +
-        ' — die pakt de extensie nog niet automatisch, koop ze in de shop.');
+      updateChurn(currentKeys, gathered);
 
-      updateChurn(currentKeys);
-
-      if (!gathered.length) { log('Nog geen kaarten in voorkeursvak(ken) · ' + nowStr()); return; }
-
-      for (const { section, seats } of gathered) {
+      for (const g of gathered) {
         if (state.cart.done) break;
-        // If specific seats were picked for this section, only chase those;
-        // otherwise take the first available (default behaviour).
-        const desired = state.desiredSeats[section.VenueBuildingBlockId];
-        const pool = (desired && desired.size) ? seats.filter(c => desired.has(c.Id)) : seats;
-        for (const col of pool) {
-          if (state.cart.done) break;
-          const key = section.VenueBuildingBlockId + ':' + col.Id;
-          if (state.cart.attempted.has(key)) continue;
-
-          log('➡️ Poging: ' + section.Name + ' — rij ' + col.RowNumber + ', stoel ' + col.SeatNumber);
-          const result = await claimSeat(section, col);
-          if (result === 'ok' || result === 'unavailable') state.cart.attempted.add(key);
-
-          if (result === 'ok') {
-            log('  · vastgehouden, in winkelwagen plaatsen…');
-            const ok = await placeInOrder();
-            if (!ok) continue;
-            state.cart.placed.push({ section, col });
-            state.cart.acquired++;
-            persistCart();
-            log('  ✓ In winkelwagen: ' + section.Name + ' rij ' + col.RowNumber + ' stoel ' + col.SeatNumber +
-                ' (' + state.cart.acquired + '/' + state.wantedCount + ')');
-            if (state.cart.acquired >= state.wantedCount) { onSuccess(); break; }
-          }
-        }
+        if (g.seats.length) { await pakStoelen(g.section, g.seats); continue; }
+        if (g.plekken !== 0) await pakPlekken(g.section, g.plekken);
       }
     } catch (e) {
       log('Fout: ' + e.message);
     }
   }
 
+  // Thuiswedstrijd: stoel voor stoel, in de volgorde die je gekozen hebt.
+  async function pakStoelen(section, seats) {
+    const desired = state.desiredSeats[section.VenueBuildingBlockId];
+    const pool = (desired && desired.size) ? seats.filter(c => desired.has(c.Id)) : seats;
+    for (const col of pool) {
+      if (state.cart.done) break;
+      const key = section.VenueBuildingBlockId + ':' + col.Id;
+      if (state.cart.attempted.has(key)) continue;
+
+      log('➡️ Poging: ' + section.Name + ' — rij ' + col.RowNumber + ', stoel ' + col.SeatNumber);
+      const result = await claimSeat(section, col);
+      if (result === 'ok' || result === 'unavailable') state.cart.attempted.add(key);
+      if (result !== 'ok') continue;
+
+      log('  · vastgehouden, in winkelwagen plaatsen…');
+      if (!await placeInOrder()) continue;
+      state.cart.placed.push({ section, col });
+      state.cart.acquired++;
+      persistCart();
+      log('  ✓ In winkelwagen: ' + section.Name + ' rij ' + col.RowNumber + ' stoel ' + col.SeatNumber +
+          ' (' + state.cart.acquired + '/' + state.wantedCount + ')');
+      if (state.cart.acquired >= state.wantedCount) { onSuccess(); return; }
+    }
+  }
+
+  // Uitwedstrijd: geen stoelkeuze; één aanroep pakt meteen het hele aantal
+  // plekken in dit vak. Mislukt dat definitief, dan slaan we het vak deze run
+  // over — anders vuren we elke ronde opnieuw een koopverzoek af.
+  async function pakPlekken(section, beschikbaar) {
+    if (state.cart.done) return;
+    const key = 'vak:' + section.VenueBuildingBlockId;
+    if (state.cart.attempted.has(key)) return;
+
+    const willen = state.wantedCount - state.cart.acquired;
+    if (willen <= 0) return;
+    const nemen = (beschikbaar === null) ? willen : Math.min(willen, beschikbaar);
+    if (nemen <= 0) return;
+
+    log('➡️ Poging: ' + nemen + ' plek(ken) in ' + section.Name);
+    const result = await claimUnplaced(section, nemen);
+    if (result === 'unavailable') { state.cart.attempted.add(key); return; }
+    if (result !== 'ok') return;
+
+    log('  · vastgehouden, in winkelwagen plaatsen…');
+    if (!await placeInOrder()) return;
+    state.cart.placed.push({ section, plekken: nemen });
+    state.cart.acquired += nemen;
+    persistCart();
+    log('  ✓ In winkelwagen: ' + nemen + ' plek(ken) in ' + section.Name +
+        ' (' + state.cart.acquired + '/' + state.wantedCount + ')');
+    if (state.cart.acquired >= state.wantedCount) onSuccess();
+  }
+
   // Compare this tick's available seats to the previous tick and report the
   // churn. Seats leaving/returning are exactly the carts expiring or filling.
-  function updateChurn(currentKeys) {
+  function updateChurn(currentKeys, gathered) {
     const prev = state.prevKeys;
     let added = 0, removed = 0;
     if (prev) {
@@ -446,18 +546,27 @@
       state.totalAppeared += added;
     }
     state.prevKeys = currentKeys;
-    ui.counter.textContent = 'Vrij nu: ' + currentKeys.size +
-      (prev ? '  ·  +' + added + ' / -' + removed + '  (totaal bijgekomen: ' + state.totalAppeared + ')' : '');
+
+    // Bij een uitwedstrijd zijn er geen stoelsleutels om te tellen; dan is het
+    // aantal vrije plekken per vak het enige zinvolle getal.
+    const plekken = (gathered || [])
+      .filter(g => g.plekken != null)
+      .reduce((a, g) => a + g.plekken, 0);
+    const heeftPlekken = (gathered || []).some(g => g.plekken != null);
+
+    ui.counter.textContent = heeftPlekken
+      ? 'Vrije plekken: ' + plekken + ' · ' + nowStr()
+      : 'Vrij nu: ' + currentKeys.size +
+        (prev ? '  ·  +' + added + ' / -' + removed + '  (totaal bijgekomen: ' + state.totalAppeared + ')' : '');
     if (prev && (added || removed)) {
       log('🔄 ' + currentKeys.size + ' vrij · +' + added + ' bij / -' + removed + ' weg');
     }
   }
 
-  // -------------------------------------------------------- verkoopwacht ---
-  // Uitwedstrijden hebben geen stoelenplattegrond (/v2/Venue/venue geeft
-  // Sections: []), dus daar valt niets te scannen. Wat er wél is: het
-  // event-record uit /v2/Event zegt of de verkoop openstaat. Deze modus pollt
-  // dat record, meldt elke wijziging en slaat alarm zodra er gekocht kan worden.
+  // ------------------------------------------------ status van het event ---
+  // Het event-record uit /v2/Event vertelt of de verkoop openstaat. Zolang er
+  // nog geen vakken zijn is dit het enige teken van leven, dus we melden elke
+  // wijziging en slaan alarm zodra er gekocht kan worden.
   const WATCH_FIELDS = [
     ['CurrentlyOnSaleForUser', 'verkoop open voor jou'],
     ['OnSaleForUserFrom', 'verkoop voor jou vanaf'],
@@ -687,55 +796,18 @@
     ui.watchCountdown.textContent = d ? 'opent over ' + d : 'omslagmoment verstreken';
   }
 
-  async function watchTick() {
-    if (!getToken()) { log('⚠️ Geen token in sessionStorage — ben je ingelogd?'); return; }
-
-    let ev;
-    try {
-      ev = (await getEventsRaw()).find(i => i.EventId === state.eventId);
-    } catch (e) {
-      log('Fout bij verkoopwacht: ' + e.message);
-      return;
-    }
-    if (!ev) { log('⚠️ Event ' + state.eventId + ' staat niet meer in de shop-lijst.'); return; }
-
+  // Wijzigingen in het event-record melden. De beginstand staat in de kaart,
+  // dus het log is er alleen voor wat er verandert.
+  function reportEventChanges(ev) {
     const now = snapshot(ev);
     const prev = state.watch.prev;
     state.watch.prev = now;
 
-    // De beginstand staat in de kaart hierboven; het log is er voor wijzigingen.
     if (prev) {
       WATCH_FIELDS.forEach(([p, label]) => {
         if (prev[p] !== now[p]) log('🔔 ' + label + ': ' + prev[p] + ' → ' + now[p]);
       });
     }
-
-    // Ook de plattegrond-kant pollen: bij een uitwedstrijd is het verschijnen van
-    // vakken (of het invullen van prijzen) het eerste harde teken van leven.
-    let vs = null;
-    try {
-      vs = summarisePlacements(await getVenue(state.eventId));
-    } catch (e) { log('  venue-check: ' + e.message); }
-
-    if (vs) {
-      const pv = state.watch.prevVenue;
-      if (pv) {
-        if (pv.sections !== vs.sections) log('🗺️ vakken: ' + pv.sections + ' → ' + vs.sections);
-        if (pv.available !== vs.available) log('🎫 kaarten vrij: ' + showVal(pv.available) + ' → ' + showVal(vs.available));
-        if (pv.priced !== vs.priced) log('💶 plaatsen met prijs: ' + pv.priced + ' → ' + vs.priced + ' (' + vs.tiers + ')');
-        if (pv.placements !== vs.placements) log('🗺️ plaatsen: ' + pv.placements + ' → ' + vs.placements);
-      }
-      // Van 0 naar >0 vakken betekent dat de stoelenscan bruikbaar wordt.
-      if (pv && pv.sections === 0 && vs.sections > 0) {
-        log('🪑 Er zijn nu vakken voor dit event — zet de modus op "Stoelen" en start de scan.');
-        beep();
-        flashTitle('🪑 VAKKEN');
-      }
-      state.watch.prevVenue = vs;
-    }
-
-    renderWatchCard(ev, vs);
-    const open = isOnSale(ev);
 
     if (needsLogin(ev) && !state.watch.loginWarned) {
       state.watch.loginWarned = true;
@@ -743,10 +815,27 @@
           'kooprechten zijn pas zichtbaar als je ingelogd bent.');
     }
 
-    if (open && !state.watch.alerted) {
+    if (isOnSale(ev) && !state.watch.alerted) {
       state.watch.alerted = true;
       onSaleOpen(ev);
     }
+  }
+
+  // Wijzigingen aan de plattegrond-kant. Het verschijnen van vakken is bij een
+  // uitwedstrijd het moment waarop er echt iets te halen valt.
+  function reportVenueChanges(vs) {
+    const pv = state.watch.prevVenue;
+    if (pv) {
+      if (pv.sections !== vs.sections) log('🗺️ vakken: ' + pv.sections + ' → ' + vs.sections);
+      if (pv.available !== vs.available) log('🎫 vrij: ' + showVal(pv.available) + ' → ' + showVal(vs.available));
+      if (pv.priced !== vs.priced) log('💶 met prijs: ' + pv.priced + ' → ' + vs.priced + ' (' + vs.tiers + ')');
+      if (pv.sections === 0 && vs.sections > 0) {
+        log('🪑 Er zijn nu vakken — de monitor gaat over op kopen.');
+        beep();
+        flashTitle('🪑 VAKKEN');
+      }
+    }
+    state.watch.prevVenue = vs;
   }
 
   async function onSaleOpen(ev) {
@@ -779,22 +868,7 @@
     if (state.watch.title !== null) { document.title = state.watch.title; state.watch.title = null; }
   }
 
-  function startWatch() {
-    if (state.watch.timer) return;
-    if (state.eventId == null) { log('Kies eerst een event.'); return; }
-    state.watch.prev = null;
-    state.watch.prevVenue = null;
-    state.watch.alerted = false;
-    state.watch.loginWarned = false;
-    const ev = state.events.find(e => e.eventId === state.eventId);
-    log('▶️ Verkoopwacht op "' + (ev ? ev.name : state.eventId) + '" · elke ' +
-        (WATCH_INTERVAL_MS / 1000) + 's een check op /v2/Event');
-    setRunning(true);
-    watchTick();
-    state.watch.timer = setInterval(watchTick, WATCH_INTERVAL_MS);
-  }
-
-  function startSeats() {
+  function start() {
     if (state.timer) return;
     if (state.eventId == null) { log('Kies eerst een event.'); return; }
     // Reuse an already-open shopping cart if the shop has one, so placed seats
@@ -813,49 +887,37 @@
     persistCart();
     state.prevKeys = null;
     state.totalAppeared = 0;
+    state.lastPoll = 0;
+    state.watch.prev = null;
+    state.watch.prevVenue = null;
+    state.watch.alerted = false;
+    state.watch.loginWarned = false;
     ui.counter.textContent = 'Vrij nu: —';
-    const names = (state.selectedOrder.length ? state.selectedOrder : state.sections.map(s => s.VenueBuildingBlockId))
-      .map((v, i) => (i + 1) + '. ' + nameByVbb(v)).join('  ');
-    log('▶️ Gestart · vakken op prioriteit: ' + names + ' · gewenst: ' + state.wantedCount);
+
+    const namen = state.selectedOrder.length
+      ? state.selectedOrder.map((v, i) => (i + 1) + '. ' + nameByVbb(v)).join('  ')
+      : (state.sections.length ? 'alle vakken' : 'nog geen vakken — we wachten tot ze verschijnen');
+    log('▶️ Gestart · ' + namen + ' · gewenst: ' + state.wantedCount);
     setRunning(true);
     tick();
     state.timer = setInterval(tick, INTERVAL_MS);
   }
 
-  function start() {
-    if (state.mode === 'watch') startWatch(); else startSeats();
-  }
-
   function stop() {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
-    if (state.watch.timer) { clearInterval(state.watch.timer); state.watch.timer = null; }
     restoreTitle();
     setRunning(false);
   }
 
-  // Van modus wisselen terwijl er een monitor loopt zou de knoppen en de teller
-  // uit sync trekken, dus de keuze ligt vast zolang hij draait.
   function setRunning(on) {
     ui.startBtn.disabled = on;
     ui.stopBtn.disabled = !on;
-    ui.modeSeats.disabled = on;
-    ui.modeWatch.disabled = on;
-  }
-
-  function setMode(mode, auto) {
-    state.mode = mode;
-    state.modeAuto = !!auto;
-    ui.modeSeats.checked = mode === 'seats';
-    ui.modeWatch.checked = mode === 'watch';
-    ui.panel.classList.toggle('nts-watchmode', mode === 'watch');
-    ui.counter.textContent = 'Vrij nu: —';
-    ui.counter.classList.remove('nts-idle');
   }
 
   function onSuccess() {
     state.cart.done = true;
     stop();
-    log('🎟️ ' + state.cart.acquired + ' stoel(en) staan in je winkelwagen — rond af!');
+    log('🎟️ ' + state.cart.acquired + ' plaats(en) staan in je winkelwagen — rond af!');
     showBanner();
     beep();
   }
@@ -1056,14 +1118,13 @@
       }
       renderSections();
       showEventCard(venue);
+      // Wat voor event dit is hoef je niet te kiezen; het blijkt uit de vakken.
+      state.lastSections = all.length;
       if (all.length === 0) {
-        log('⚠️ Geen stoelenplattegrond voor dit event (bijv. een uitwedstrijd) — de stoelenscan kan hier niets. Modus staat nu op 🔔 Verkoopwacht.');
-        setMode('watch', true);
+        log('⏳ Nog geen vakken voor dit event — start gerust, de monitor pakt ze ' +
+            'zodra ze verschijnen.');
       } else {
         log('✓ ' + all.length + ' vak(ken). Klik ze aan op prioriteit (of laat leeg = alle).');
-        // Alleen een eerdere automatische switch terugdraaien — een handmatig
-        // gekozen modus blijft staan.
-        if (state.modeAuto) setMode('seats', true);
       }
     } catch (e) {
       log('Kon vakken niet laden: ' + e.message);
@@ -1114,12 +1175,9 @@
       '<div class="nts-body">',
       '  <div class="nts-row"><button class="nts-events">Events laden</button>',
       '    <select class="nts-event"><option value="">— kies event —</option></select></div>',
-      '  <div class="nts-row"><span class="nts-mode-label">Modus:</span>',
-      '    <label><input type="radio" name="nts-mode" class="nts-mode-seats" checked> 🪑 Stoelen</label>',
-      '    <label><input type="radio" name="nts-mode" class="nts-mode-watch"> 🔔 Verkoopwacht</label></div>',
       '  <div class="nts-label">Vakken (klik = prioriteit, 🪑 = kies stoelen): <button class="nts-refresh" title="ververs vakken">↻</button></div>',
       '  <div class="nts-sections"></div>',
-      '  <div class="nts-row nts-countrow"><label>Aantal stoelen: <input type="number" class="nts-count" min="1" value="1"></label></div>',
+      '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label></div>',
       '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>',
       '  <div class="nts-watchcard"></div>',
       '  <div class="nts-counter">Vrij nu: —</div>',
@@ -1134,8 +1192,6 @@
     ui.event = panel.querySelector('.nts-event');
     ui.sections = panel.querySelector('.nts-sections');
     ui.count = panel.querySelector('.nts-count');
-    ui.modeSeats = panel.querySelector('.nts-mode-seats');
-    ui.modeWatch = panel.querySelector('.nts-mode-watch');
     ui.startBtn = panel.querySelector('.nts-start');
     ui.stopBtn = panel.querySelector('.nts-stop');
     ui.reloadBtn = panel.querySelector('.nts-reload');
@@ -1146,8 +1202,6 @@
     ui.log = panel.querySelector('.nts-log');
 
     panel.querySelector('.nts-events').addEventListener('click', loadEvents);
-    ui.modeSeats.addEventListener('change', () => setMode('seats', false));
-    ui.modeWatch.addEventListener('change', () => setMode('watch', false));
     ui.refresh.addEventListener('click', () => { if (state.eventId != null) loadSections(state.eventId, true); });
     ui.event.addEventListener('change', () => {
       const val = ui.event.value;

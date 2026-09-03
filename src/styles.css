@@ -282,16 +282,7 @@
   border-color: var(--nts-border);
 }
 
-/* Verkoopwacht-modus: de stoel-specifieke controls doen hier niets, dus weg. */
-#nts-panel .nts-mode-label { color: var(--nts-muted); font-size: 12px; }
-#nts-panel input[type="radio"] { accent-color: var(--nts-green); margin: 0; }
-#nts-panel.nts-watchmode .nts-label,
-#nts-panel.nts-watchmode .nts-sections,
-#nts-panel.nts-watchmode .nts-countrow,
-#nts-panel.nts-watchmode .nts-counter,
-#nts-panel.nts-watchmode .nts-reload { display: none; }
-
-/* Verkoopwacht-statuskaart */
+/* Statuskaart van het event */
 #nts-panel .nts-watchcard:empty { display: none; }
 #nts-panel .nts-watchcard {
   flex: 0 0 auto;
