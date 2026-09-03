@@ -621,6 +621,27 @@
     updateCountdown();
   }
 
+  // De kaart hoort er te staan zodra je een event kiest, in beide modi. Het
+  // venue-antwoord hebben we bij het laden van de vakken al, dus dat geven we
+  // door in plaats van het nog eens op te halen.
+  function clearEventCard() {
+    ui.watchCard.innerHTML = '';
+    ui.watchCountdown = null;          // anders schrijft de aftelling naar een
+    state.watch.opensAt = null;        // element dat niet meer in de DOM hangt
+  }
+
+  async function showEventCard(venue) {
+    if (state.eventId == null) { clearEventCard(); return; }
+    try {
+      const ev = (await getEventsRaw()).find(i => i.EventId === state.eventId);
+      if (!ev) { clearEventCard(); return; }
+      const vs = summarisePlacements(venue || await getVenue(state.eventId));
+      renderWatchCard(ev, vs);
+    } catch (e) {
+      log('Kon de statuskaart niet laden: ' + e.message);
+    }
+  }
+
   // Loopt elke seconde zodat de aftelling niet 30s stilstaat.
   function updateCountdown() {
     if (!ui.watchCountdown) return;
@@ -735,7 +756,6 @@
     setRunning(true);
     watchTick();
     state.watch.timer = setInterval(watchTick, WATCH_INTERVAL_MS);
-    state.watch.tick1s = setInterval(updateCountdown, 1000);
   }
 
   function startSeats() {
@@ -773,7 +793,6 @@
   function stop() {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
     if (state.watch.timer) { clearInterval(state.watch.timer); state.watch.timer = null; }
-    if (state.watch.tick1s) { clearInterval(state.watch.tick1s); state.watch.tick1s = null; }
     restoreTitle();
     setRunning(false);
   }
@@ -795,7 +814,6 @@
     ui.panel.classList.toggle('nts-watchmode', mode === 'watch');
     ui.counter.textContent = 'Vrij nu: —';
     ui.counter.classList.remove('nts-idle');
-    if (mode !== 'watch') ui.watchCard.innerHTML = '';
   }
 
   function onSuccess() {
@@ -1001,6 +1019,7 @@
         state.desiredSeats = {};
       }
       renderSections();
+      showEventCard(venue);
       if (all.length === 0) {
         log('⚠️ Geen stoelenplattegrond voor dit event (bijv. een uitwedstrijd) — de stoelenscan kan hier niets. Modus staat nu op 🔔 Verkoopwacht.');
         setMode('watch', true);
@@ -1108,6 +1127,7 @@
         persistCart();
       }
       if (state.eventId != null) loadSections(state.eventId, false);
+      else clearEventCard();
     });
     ui.count.addEventListener('change', () => {
       const n = parseInt(ui.count.value, 10);
@@ -1124,6 +1144,7 @@
 
     refreshTokenStatus();
     setInterval(refreshTokenStatus, 3000);
+    setInterval(updateCountdown, 1000);
     log('Klaar. Zorg dat je ingelogd bent en door de wachtrij, klik "Events laden".');
     restoreCart();
   }
