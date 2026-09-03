@@ -98,5 +98,9 @@ jobs:
             echo "Niets gewijzigd — niets te committen."
           else
             git commit -m "Release $VERSION [skip ci]"
+            # main kan intussen verschoven zijn (bijv. door de Build-workflow);
+            # zonder rebase faalt de push met non-fast-forward terwijl het
+            # signen en de release al gelukt zijn.
+            git pull --rebase origin main
             git push
           fi
