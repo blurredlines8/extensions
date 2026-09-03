@@ -695,13 +695,20 @@
     const card = ui.watchCard;
     card.innerHTML = '';
     const open = isOnSale(ev);
+    // Logged in, the API tells this customer exactly when their phase opens:
+    // OnSaleForUserFrom (UTC). That beats guessing from the button. Observed on
+    // event 260: anonymous null, logged in '2026-09-04T10:00:00' while the
+    // button still announced an earlier phase meant for other card holders.
+    const forUser = asUtcDate(ev.OnSaleForUserFrom);
     const till = asUtcDate(pick(ev, 'ButtonData.ActiveTill'));
     // If the button's end coincides with kickoff it is a placeholder ("Info
     // volgt") and not a sale moment — do not count down then, or we suggest an
     // opening time that means nothing.
     const kickoff = asUtcDate(ev.EventStartDateTime);
     const isPlaceholder = !!(till && kickoff && till.getTime() === kickoff.getTime());
-    state.watch.opensAt = (open || isPlaceholder) ? null : till;
+    const target = forUser || (isPlaceholder ? null : till);
+    state.watch.opensAt = (open || !target || target.getTime() <= Date.now()) ? null : target;
+    state.watch.opensAtIsPersonal = !!forUser;
 
     const el = (tag, cls, text) => {
       const n = document.createElement(tag);
@@ -723,6 +730,10 @@
     status.appendChild(ui.watchCountdown);
     card.appendChild(status);
 
+    if (forUser && !open) {
+      card.appendChild(el('div', 'nts-wc-when',
+        'jouw fase: ' + fmtLocal(forUser) + '  (API: ' + ev.OnSaleForUserFrom + ' UTC)'));
+    }
     // Only show the club's own label when it adds something.
     if (label && !STATUS_TEXT[label]) {
       const b = el('div', 'nts-wc-button', label);
@@ -790,7 +801,8 @@
     const at = state.watch.opensAt;
     if (!at) { ui.watchCountdown.textContent = ''; return; }
     const d = fmtDuration(at.getTime() - Date.now());
-    ui.watchCountdown.textContent = d ? 'opent over ' + d : 'omslagmoment verstreken';
+    const wie = state.watch.opensAtIsPersonal ? 'voor jou ' : '';
+    ui.watchCountdown.textContent = d ? 'opent ' + wie + 'over ' + d : 'omslagmoment verstreken';
   }
 
   // Report changes in the event record. The initial state is in the card, so
