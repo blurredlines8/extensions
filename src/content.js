@@ -117,6 +117,20 @@
   // Hoeveel er vrij is in een unplaced vak. De precieze vorm van Availability
   // hebben we nog niet in het echt gezien, dus meerdere velden proberen en bij
   // twijfel null teruggeven (dan tonen we "?" i.p.v. een verzonnen getal).
+  // Venue/venue geeft per vak al een telling mee: AvailableSeats (bij de
+  // thuiswedstrijden van FC Eindhoven 226, 65, 136 …) en TicketsPerTicketTypeId.
+  // Voor een vak zonder stoelnummers is dat dé bron — section-unplaced hoeft
+  // dan alleen nog voor de details.
+  function countFromSection(section) {
+    if (!section) return null;
+    const t = section.TicketsPerTicketTypeId;
+    if (t && typeof t === 'object') {
+      const n = Object.values(t).reduce((a, b) => a + (Number(b) || 0), 0);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return Number.isFinite(section.AvailableSeats) ? section.AvailableSeats : null;
+  }
+
   function countUnplaced(u) {
     if (!u) return null;
     const t = u.Details && u.Details.TicketsPerTicketTypeId;
@@ -357,7 +371,7 @@
           let u = null;
           try { u = await getSectionUnplaced(section.VenueBuildingBlockId, state.eventId); }
           catch (e) { log('  section-unplaced ' + section.Name + ': ' + e.message); }
-          const n = countUnplaced(u);
+          const n = countUnplaced(u) ?? countFromSection(section);
           if (!state.unplacedSeen.has(section.VenueBuildingBlockId)) {
             state.unplacedSeen.add(section.VenueBuildingBlockId);
             // Eén keer de ruwe vorm loggen: die hebben we nog nooit gevuld gezien.
