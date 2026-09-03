@@ -7,9 +7,9 @@
   const INTERVAL_MS = 5000;
   const CART_URL = '__SHOP_ORIGIN__/shopping-cart';
   const SHOP_URL = '__SHOP_ORIGIN__/';
-  // Zolang er nog geen vakken zijn hoeft de monitor niet op volle snelheid;
-  // dat wachten kan dagen duren. Ook het event-record wordt op dit ritme
-  // ververst, want dat verandert traag.
+  // While there are no sections yet the monitor need not run at full speed;
+  // that wait can last for days. The event record is refreshed on this same
+  // slow cadence, since it changes rarely.
   const WAIT_INTERVAL_MS = 30000;
 
   const state = {
@@ -22,10 +22,10 @@
     wantedCount: 1,
     timer: null,
     watch: { timer: null, prev: null, alerted: false, title: null },
-    unplacedSeen: new Set(),   // vakken waarvan we de unplaced-vorm al logden
-    lastSections: 0,           // aantal vakken bij de vorige ronde
-    lastPoll: 0,               // tijdstip van de vorige ronde (voor de wachtstand)
-    evRecord: null,            // laatst opgehaalde event-record
+    unplacedSeen: new Set(),   // sections whose unplaced shape we already logged
+    lastSections: 0,           // section count from the previous round
+    lastPoll: 0,               // timestamp of the previous round (for the wait mode)
+    evRecord: null,            // most recently fetched event record
     evFetched: 0,
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
@@ -60,13 +60,13 @@
     return h;
   };
   const nowStr = () => new Date().toLocaleTimeString('nl-NL');
-  // Alleen PlacementTypeId 1 is een echte, boekbare stoel; 2/3 zijn trap/gang/
-  // "no-seat" (staan altijd "vrij" want ze worden nooit verkocht).
+  // Only PlacementTypeId 1 is a real, bookable seat; 2/3 are stairs/aisle/
+  // "no-seat" (always report as "free" because they are never sold).
   const isSeat = c => c.PlacementTypeId === 1;
 
   // ------------------------------------------------------------------ API ---
-  // Rauwe event-records: de statuskaart kijkt naar velden die de mapping
-  // hieronder weggooit (ButtonData, OnGeneralSaleFrom, …).
+  // Raw event records: the status card needs fields that the mapping below
+  // throws away (ButtonData, OnGeneralSaleFrom, …).
   async function getEventsRaw() {
     const res = await fetch(API + '/v2/Event', { credentials: 'omit', headers: headers() });
     if (!res.ok) throw new Error('Event HTTP ' + res.status);
@@ -97,8 +97,8 @@
     return res.json();
   }
 
-  // Vakken zonder genummerde stoelen (staanplaatsen, uitvakken) hebben een eigen
-  // endpoint. Payload afgeleid uit de shop-bundle (getUnplacedData).
+  // Sections without numbered seats (standing room, away sections) have their
+  // own endpoint. Payload derived from the shop bundle (getUnplacedData).
   async function getSectionUnplaced(vbbId, eventId) {
     const res = await fetch(API + '/v2/Availability/section-unplaced', {
       method: 'POST', credentials: 'omit', headers: headers(),
@@ -108,22 +108,19 @@
     return res.json();
   }
 
-  // De shop stuurt hier de waarde uit sessionStorage['ai'] mee; wij deden dat nog
-  // niet. Bij kooprecht-verkopen kan dat uitmaken.
+  // The shop passes the value from sessionStorage['ai'] here; we did not.
+  // It may matter for sales gated behind purchase rights.
   const getInitiativeGuid = () => {
     try { return window.sessionStorage.getItem('ai') || null; } catch (e) { return null; }
   };
 
-  // Zo bepaalt de shop het zelf: geen rijen terug = het is een unplaced vak.
+  // Exactly how the shop decides it: no rows returned = an unplaced section.
   const isUnplacedDetail = d => !d || !d.Rows || d.Rows.length === 0;
 
-  // Hoeveel er vrij is in een unplaced vak. De precieze vorm van Availability
-  // hebben we nog niet in het echt gezien, dus meerdere velden proberen en bij
-  // twijfel null teruggeven (dan tonen we "?" i.p.v. een verzonnen getal).
-  // Venue/venue geeft per vak al een telling mee: AvailableSeats (bij de
-  // thuiswedstrijden van FC Eindhoven 226, 65, 136 …) en TicketsPerTicketTypeId.
-  // Voor een vak zonder stoelnummers is dat dé bron — section-unplaced hoeft
-  // dan alleen nog voor de details.
+  // Venue/venue already carries a count per section: AvailableSeats (226, 65,
+  // 136 … on FC Eindhoven's home fixtures) and TicketsPerTicketTypeId. For a
+  // section without seat numbers that is the source; section-unplaced is then
+  // only needed for the details.
   function countFromSection(section) {
     if (!section) return null;
     const t = section.TicketsPerTicketTypeId;
@@ -194,13 +191,13 @@
     }
   }
 
-  // Een plek kopen in een vak zonder stoelnummers. Payload afgeleid uit de
-  // shop-bundle (addUnplacedTickets → unplaced-event-selection): één aanroep
-  // pakt meteen `amount` plekken, anders dan bij stoelen waar we per stoel
-  // langsgaan. Retourneert 'ok' | 'unavailable' | 'error', net als claimSeat.
+  // Buy a spot in a section without seat numbers. Payload derived from the shop
+  // bundle (addUnplacedTickets → unplaced-event-selection): a single call takes
+  // `amount` spots at once, unlike seats where we go one by one. Returns
+  // 'ok' | 'unavailable' | 'error', just like claimSeat.
   //
-  // LET OP: deze aanroep is afgeleid uit hun JavaScript, niet in het echt
-  // waargenomen. De eerste keer dat hij vuurt is meteen menens.
+  // NOTE: this call was derived from their JavaScript, never observed in the
+  // wild. The first time it fires is the real thing.
   async function claimUnplaced(section, amount) {
     const body = {
       PendingReservationId: state.cart.reservationId,
@@ -220,7 +217,7 @@
       if (!res.ok) { log('  unplaced-event-selection HTTP ' + res.status); return 'error'; }
       let data = await res.json();
 
-      // Zelfde tweede poging als bij stoelen; de shop doet het ook zo.
+      // Same second attempt as for seats; the shop does it this way too.
       if (data.ResultCode === 'MultiSelectRequired' || data.ResultCode === 'BundleRequired') {
         body.AllowAutoSelect = true;
         res = await post();
@@ -269,7 +266,7 @@
       try {
         window.sessionStorage.setItem('shoppingCartData',
           JSON.stringify({ PendingOrderId: data.PendingOrderId, PendingOrderUID: data.PendingOrderUID }));
-      } catch (e) { /* geen sessionStorage-toegang is niet fataal */ }
+      } catch (e) { /* no sessionStorage access is not fatal */ }
       // Placing clears the reservation server-side; the next seat starts fresh.
       state.cart.reservationId = null;
       state.cart.reservationUID = null;
@@ -304,7 +301,7 @@
           col: { Row: p.col.Row, Column: p.col.Column, RowNumber: p.col.RowNumber, SeatNumber: p.col.SeatNumber, Id: p.col.Id },
         })),
       }));
-    } catch (e) { /* sessionStorage kan falen; niet fataal */ }
+    } catch (e) { /* sessionStorage may fail; not fatal */ }
   }
   function restoreCart() {
     try {
@@ -318,14 +315,14 @@
       state.cart.placed = Array.isArray(c.placed) ? c.placed : [];
       state.cart.acquired = state.cart.placed.length;
       if (state.cart.placed.length) {
-        log('↩️ Winkelwagen-context hersteld: ' + state.cart.placed.length + ' stoel(en). "🔄 Herlaad" is beschikbaar.');
+        log('↩️ Winkelwagen-context hersteld: ' + state.cart.placed.length + ' stoel(en). "🔄 Herlaad" is available.');
       }
-    } catch (e) { /* corrupte context negeren */ }
+    } catch (e) { /* ignore a corrupt context */ }
   }
 
-  // Reload: gooi de gecarte stoelen uit de winkelwagen en zet ze meteen opnieuw
-  // erin — een schone staat voor als een stoel "vast" lijkt te zitten. Doet
-  // exact wat de shop doet (regels DELETEn, order clearen) en herbouwt daarna.
+  // Reload: throw the carted seats out of the shopping cart and put them back
+  // again — a clean slate for when a seat appears to be "stuck". Does exactly
+  // what the shop does (DELETE the lines, clear the order) and rebuilds after.
   async function reloadCart() {
     const placed = (state.cart.placed || []).slice();
     if (!state.cart.orderId || !placed.length) { log('Niks in de winkelwagen om te herladen.'); return; }
@@ -336,8 +333,8 @@
     try {
       log('🔄 Winkelwagen herladen (' + placed.length + ' stoel(en))…');
 
-      // 1. Verwijder de stoel-regels (ProductType 2/3 = bezorg-/betaalregel, die
-      //    laten we staan). Elke regel heeft een .Id = de line-id voor de DELETE.
+      // 1. Remove the seat lines (ProductType 2/3 = delivery/payment line, we
+      //    leave those). Every line has an .Id = the line id for the DELETE.
       const details = await getOrderDetails(orderId, orderUID);
       const lines = (details && (details.OrderLines
         || (details.PendingOrderDetails && details.PendingOrderDetails.OrderLines))) || [];
@@ -352,21 +349,21 @@
         } catch (e) { log('  delete-line error: ' + e.message); }
       }
 
-      // 2. Maak de (nu lege) order leeg/weg.
+      // 2. Clear the (now empty) order.
       try {
         await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(orderId) + '/clear/' + encodeURIComponent(orderUID), {
           method: 'GET', credentials: 'omit', headers: headers(),
         });
       } catch (e) { log('  clear error: ' + e.message); }
 
-      // Verse start: volgende plaatsing maakt een nieuwe order aan.
+      // Fresh start: the next placement creates a new order.
       state.cart.orderId = null; state.cart.orderUID = null;
       state.cart.reservationId = null; state.cart.reservationUID = null;
       state.cart.placed = [];
       persistCart();
       try { window.sessionStorage.removeItem('shoppingCartData'); } catch (e) { /* ok */ }
 
-      // 3. Zet dezelfde stoelen opnieuw in de winkelwagen.
+      // 3. Put the same seats back into the shopping cart.
       let back = 0;
       for (const p of placed) {
         const r = await claimSeat(p.section, p.col);
@@ -388,29 +385,29 @@
   }
 
   // -------------------------------------------------------------- monitor ---
-  // Eén monitor voor beide soorten events; wat voor event het is leiden we af
-  // uit de plattegrond zelf:
+  // One monitor for both kinds of event; which kind it is follows from the
+  // venue map itself:
   //
-  //   geen vakken        → er valt nog niets te halen, we blijven kijken
-  //   vak mét rijen      → thuiswedstrijd: kies een stoel
-  //   vak zónder rijen   → uitwedstrijd: koop een plek in dat vak
+  //   no sections          → nothing to take yet, keep watching
+  //   section with rows    → home fixture: pick a seat
+  //   section without rows → away fixture: buy a spot in that section
   //
-  // Dat is precies de regel die de shop zelf ook hanteert (geen Rows = unplaced).
+  // That is exactly the rule the shop itself applies (no Rows = unplaced).
   async function tick() {
     if (state.cart.done || state.reloading) return;
     if (!getToken()) { log('⚠️ Geen token in sessionStorage — ben je ingelogd?'); return; }
 
-    // In de wachtstand (nog geen vakken) hoeft het niet elke 5 seconden; dat kan
-    // dagen duren. Zodra er vakken zijn, gaan we op volle snelheid.
+    // In wait mode (no sections yet) every 5 seconds is pointless; this can go
+    // on for days. Once sections exist we switch to full speed.
     const nu = Date.now();
     if (state.lastSections === 0 && state.lastPoll && nu - state.lastPoll < WAIT_INTERVAL_MS) return;
     state.lastPoll = nu;
 
     try {
-      // Het event-record verandert traag; niet bij elke ronde ophalen.
+      // The event record changes slowly; do not fetch it every round.
       if (!state.evRecord || nu - state.evFetched > WAIT_INTERVAL_MS) {
-        const vers = (await getEventsRaw()).find(i => i.EventId === state.eventId);
-        if (vers) { reportEventChanges(vers); state.evRecord = vers; }
+        const fresh = (await getEventsRaw()).find(i => i.EventId === state.eventId);
+        if (fresh) { reportEventChanges(fresh); state.evRecord = fresh; }
         state.evFetched = nu;
       }
 
@@ -442,7 +439,7 @@
         return;
       }
 
-      // Eén fetch per vak, hergebruikt voor zowel de teller als de koopronde.
+      // One fetch per section, reused for both the counter and the claim pass.
       const gathered = [];
       const currentKeys = new Set();
       for (const section of secs) {
@@ -459,7 +456,7 @@
             log('🎫 ' + section.Name + ' is een vak zonder stoelnummers · ' +
                 (n === null ? 'aantal onbekend' : n + ' plek(ken) vrij'));
           }
-          gathered.push({ section, seats: [], plekken: n });
+          gathered.push({ section, seats: [], spots: n });
           continue;
         }
 
@@ -474,16 +471,16 @@
 
       for (const g of gathered) {
         if (state.cart.done) break;
-        if (g.seats.length) { await pakStoelen(g.section, g.seats); continue; }
-        if (g.plekken !== 0) await pakPlekken(g.section, g.plekken);
+        if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
+        if (g.spots !== 0) await claimSpots(g.section, g.spots);
       }
     } catch (e) {
       log('Fout: ' + e.message);
     }
   }
 
-  // Thuiswedstrijd: stoel voor stoel, in de volgorde die je gekozen hebt.
-  async function pakStoelen(section, seats) {
+  // Home fixture: seat by seat, in the priority order you picked.
+  async function claimSeats(section, seats) {
     const desired = state.desiredSeats[section.VenueBuildingBlockId];
     const pool = (desired && desired.size) ? seats.filter(c => desired.has(c.Id)) : seats;
     for (const col of pool) {
@@ -507,30 +504,31 @@
     }
   }
 
-  // Uitwedstrijd: geen stoelkeuze; één aanroep pakt meteen het hele aantal
-  // plekken in dit vak. Mislukt dat definitief, dan slaan we het vak deze run
-  // over — anders vuren we elke ronde opnieuw een koopverzoek af.
-  async function pakPlekken(section, beschikbaar) {
+  // Away fixture: no seat choice; a single call takes the whole requested
+  // amount of spots in this section. If that fails definitively we skip the
+  // section for this run — otherwise we would fire a purchase request every
+  // single round.
+  async function claimSpots(section, available) {
     if (state.cart.done) return;
     const key = 'vak:' + section.VenueBuildingBlockId;
     if (state.cart.attempted.has(key)) return;
 
-    const willen = state.wantedCount - state.cart.acquired;
-    if (willen <= 0) return;
-    const nemen = (beschikbaar === null) ? willen : Math.min(willen, beschikbaar);
-    if (nemen <= 0) return;
+    const wanted = state.wantedCount - state.cart.acquired;
+    if (wanted <= 0) return;
+    const take = (available === null) ? wanted : Math.min(wanted, available);
+    if (take <= 0) return;
 
-    log('➡️ Poging: ' + nemen + ' plek(ken) in ' + section.Name);
-    const result = await claimUnplaced(section, nemen);
+    log('➡️ Poging: ' + take + ' plek(ken) in ' + section.Name);
+    const result = await claimUnplaced(section, take);
     if (result === 'unavailable') { state.cart.attempted.add(key); return; }
     if (result !== 'ok') return;
 
     log('  · vastgehouden, in winkelwagen plaatsen…');
     if (!await placeInOrder()) return;
-    state.cart.placed.push({ section, plekken: nemen });
-    state.cart.acquired += nemen;
+    state.cart.placed.push({ section, spots: take });
+    state.cart.acquired += take;
     persistCart();
-    log('  ✓ In winkelwagen: ' + nemen + ' plek(ken) in ' + section.Name +
+    log('  ✓ In winkelwagen: ' + take + ' plek(ken) in ' + section.Name +
         ' (' + state.cart.acquired + '/' + state.wantedCount + ')');
     if (state.cart.acquired >= state.wantedCount) onSuccess();
   }
@@ -547,15 +545,15 @@
     }
     state.prevKeys = currentKeys;
 
-    // Bij een uitwedstrijd zijn er geen stoelsleutels om te tellen; dan is het
-    // aantal vrije plekken per vak het enige zinvolle getal.
-    const plekken = (gathered || [])
-      .filter(g => g.plekken != null)
-      .reduce((a, g) => a + g.plekken, 0);
-    const heeftPlekken = (gathered || []).some(g => g.plekken != null);
+    // For an away fixture there are no seat keys to count; the number of free
+    // spots per section is then the only meaningful figure.
+    const spots = (gathered || [])
+      .filter(g => g.spots != null)
+      .reduce((a, g) => a + g.spots, 0);
+    const heeftPlekken = (gathered || []).some(g => g.spots != null);
 
     ui.counter.textContent = heeftPlekken
-      ? 'Vrije plekken: ' + plekken + ' · ' + nowStr()
+      ? 'Vrije spots: ' + spots + ' · ' + nowStr()
       : 'Vrij nu: ' + currentKeys.size +
         (prev ? '  ·  +' + added + ' / -' + removed + '  (totaal bijgekomen: ' + state.totalAppeared + ')' : '');
     if (prev && (added || removed)) {
@@ -563,24 +561,24 @@
     }
   }
 
-  // ------------------------------------------------ status van het event ---
-  // Het event-record uit /v2/Event vertelt of de verkoop openstaat. Zolang er
-  // nog geen vakken zijn is dit het enige teken van leven, dus we melden elke
-  // wijziging en slaan alarm zodra er gekocht kan worden.
+  // ----------------------------------------------------- event status ---
+  // The event record from /v2/Event says whether the sale is open. While there
+  // are no sections yet this is the only sign of life, so we report every
+  // change and raise the alarm as soon as buying becomes possible.
   const WATCH_FIELDS = [
     ['CurrentlyOnSaleForUser', 'verkoop open voor jou'],
     ['OnSaleForUserFrom', 'verkoop voor jou vanaf'],
     ['HasGeneralSale', 'vrije verkoop'],
     ['OnGeneralSaleFrom', 'vrije verkoop vanaf'],
-    ['HasTicketsAvailable', 'kaarten beschikbaar'],
+    ['HasTicketsAvailable', 'kaarten available'],
     ['HasSoldOut', 'uitverkocht'],
     ['SalesFlowAllowed', 'verkoopflow toegestaan'],
     ['PurchaseRightAvailableAfterLogin', 'kooprecht na inloggen'],
     ['ButtonData.ActionType', 'knop-actie'],
     ['ButtonData.TranslationCode', 'knoptekst'],
     ['ButtonData.Action', 'knop-doel'],
-    // Het venster van de huidige knop: ActiveTill is het moment waarop de shop
-    // naar de volgende fase wisselt — vaak precies de start van de verkoop.
+    // The window of the current button: ActiveTill is the moment the shop flips
+    // to the next phase — often exactly when the sale starts.
     ['ButtonData.ActiveFrom', 'knop actief vanaf'],
     ['ButtonData.ActiveTill', 'knop actief tot'],
   ];
@@ -588,27 +586,27 @@
   const pick = (obj, path) => path.split('.').reduce((o, k) => (o == null ? o : o[k]), obj);
   const showVal = v => (v === null || v === undefined || v === '' ? '—' : String(v));
 
-  // "Er valt nu iets te halen". ButtonData komt in twee smaken, geverifieerd
-  // tegen twee onafhankelijke shops op ditzelfde backend-platform:
+  // "There is something to take now". ButtonData comes in two shapes, verified
+  // against two independent shops on this same backend platform:
   //
-  //   • stub (Id 0 / EventId 0) = geen eigen knop geconfigureerd. De shop toont
-  //     zijn standaardknop en de TranslationCode zegt de échte status:
-  //     BTN.SALE.BUYNOW / BTN.SALE.LOGINTOBUY = koopbaar, BTN.SALE.SOLDOUT = uit.
-  //   • geconfigureerd (Id != 0) = een clublabel als "Info volgt" of "Start
-  //     verkoop 7 sept", met ActionType 'Disabled' óf -1. Dat is juist GEEN
-  //     verkoop, alleen een aankondiging.
+  //   • stub (Id 0 / EventId 0) = no custom button configured. The shop renders
+  //     its default button and the TranslationCode carries the real status:
+  //     BTN.SALE.BUYNOW / BTN.SALE.LOGINTOBUY = buyable, BTN.SALE.SOLDOUT = out.
+  //   • configured (Id != 0) = a club label such as "Info volgt" or "Start
+  //     verkoop 7 sept", with ActionType 'Disabled' or -1. That is precisely NOT
+  //     a sale, just an announcement.
   //
-  // ActionType is dus onbruikbaar als alarmsignaal (-1 en 'Disabled' betekenen
-  // allebei "niets te doen", null betekent alleen "geen eigen knop"). We gaan af
-  // op de vlaggen, met de standaardknop als bevestiging.
+  // ActionType is therefore useless as an alarm signal (-1 and 'Disabled' both
+  // mean "nothing to do", null only means "no custom button"). We go by the
+  // flags, with the default button as corroboration.
   const isDefaultButton = b => !!b && !b.Id;
   const buttonCode = ev => (isDefaultButton(ev.ButtonData) ? ev.ButtonData.TranslationCode : null);
 
-  // BTN.SALE.LOGINTOBUY telt NIET als verkoop. Gemeten bij FC Eindhoven: hun
-  // uitwedstrijden staan op LOGINTOBUY met CurrentlyOnSaleForUser=false en
-  // PurchaseRightAvailableAfterLogin=true — "log in, misschien is er iets voor
-  // jou", geen koopmoment. Wij draaien binnen een ingelogde sessie, dus die
-  // knop betekent hier eerder dat de login weg is. Aparte melding, geen alarm.
+  // BTN.SALE.LOGINTOBUY does NOT count as a sale. Measured at FC Eindhoven:
+  // their away fixtures sit on LOGINTOBUY with CurrentlyOnSaleForUser=false and
+  // PurchaseRightAvailableAfterLogin=true — "log in, there may be something for
+  // you", not a moment to buy. We run inside a logged-in session, so that button
+  // here rather means the login is gone. Separate notice, no alarm.
   const isOnSale = ev =>
     ev.CurrentlyOnSaleForUser === true ||
     ev.HasGeneralSale === true ||
@@ -616,9 +614,9 @@
 
   const needsLogin = ev => buttonCode(ev) === 'BTN.SALE.LOGINTOBUY';
 
-  // Uitwedstrijden geven Sections: [], maar Venue/venue verklapt wél hoeveel
-  // plaatsen er zijn en welke prijzen erop staan. Die prijzen worden ingevuld
-  // naarmate de verkoop nadert — een vroeg signaal, ruim vóór de knop omklapt.
+  // Away fixtures return Sections: [], but Venue/venue does reveal how many
+  // placements there are and which prices they carry. Those prices get filled in
+  // as the sale approaches — an early signal, well before the button flips.
   function summarisePlacements(venue) {
     const epf = (venue && venue.Filters && venue.Filters.EventPlacementFilters) || [];
     const byPrice = new Map();
@@ -643,10 +641,10 @@
     };
   }
 
-  // De API stuurt naïeve tijdstempels zonder zone. Dat ze UTC zijn blijkt uit de
-  // knop zelf: ActiveTill 2026-09-03T10:00:00 hoort bij knoptekst "03-09, 12:00
-  // uur" — precies het CEST-verschil. We tonen daarom lokale tijd én de ruwe
-  // waarde, zodat een verkeerde aanname meteen opvalt.
+  // The API sends naive timestamps without a zone. That they are UTC follows
+  // from the button itself: ActiveTill 2026-09-03T10:00:00 belongs to button
+  // text "03-09, 12:00 uur" — exactly the CEST offset. So we show local time as
+  // well as the raw value, making a wrong assumption obvious straight away.
   const asUtcDate = v => {
     if (!v || typeof v !== 'string') return null;
     const d = new Date(/[Z+]|-\d\d:\d\d$/.test(v) ? v : v + 'Z');
@@ -654,8 +652,8 @@
   };
   const fmtLocal = d => d.toLocaleString('nl-NL',
     { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-  // Grofheid meeschalen met de afstand: seconden zijn ruis op tien dagen, en
-  // "244u" leest niemand.
+  // Scale the granularity with the distance: seconds are noise across ten days,
+  // and nobody reads "244u".
   function fmtDuration(ms) {
     if (ms < 0) return null;
     const s = Math.floor(ms / 1000);
@@ -666,7 +664,7 @@
     if (s >= 600) return m + 'm';
     return (m ? m + 'm ' : '') + sec + 's';
   }
-  const jaNee = v => (v === true ? 'ja' : v === false ? 'nee' : '—');
+  const yesNo = v => (v === true ? 'ja' : v === false ? 'nee' : '—');
 
   const snapshot = ev => {
     const s = {};
@@ -674,8 +672,8 @@
     return s;
   };
 
-  // Wat de shop-knop betekent, in gewone taal. De BTN.SALE.*-codes zijn de
-  // standaardknop; een eigen clublabel tonen we ongewijzigd, dat zegt meer.
+  // What the shop button means, in plain language. The BTN.SALE.* codes are the
+  // default button; a club's own label we show unchanged, it says more.
   const STATUS_TEXT = {
     'BTN.SALE.SOLDOUT': 'Uitverkocht',
     'BTN.SALE.BUYNOW': 'In verkoop',
@@ -683,8 +681,8 @@
     'BTN.SALE.NOTONSALE': 'Niet in verkoop voor jou',
   };
 
-  // Lange prijslijsten inkorten tot een bereik; zes staffels achter elkaar
-  // vullen de halve kaart en zeggen niet meer dan "van … tot …".
+  // Shorten long price lists to a range; six tiers in a row fill half the card
+  // and say no more than "from … to …".
   function priceLabel(vs) {
     if (!vs || !vs.prices || !vs.prices.length) return null;
     const p = vs.prices;
@@ -698,11 +696,11 @@
     card.innerHTML = '';
     const open = isOnSale(ev);
     const till = asUtcDate(pick(ev, 'ButtonData.ActiveTill'));
-    // Valt het einde van de knop samen met de aftrap, dan is het een
-    // placeholder ("Info volgt") en geen verkoopmoment — dan niet aftellen,
-    // anders suggereren we een openingstijd die nergens op slaat.
-    const kick = asUtcDate(ev.EventStartDateTime);
-    const isPlaceholder = !!(till && kick && till.getTime() === kick.getTime());
+    // If the button's end coincides with kickoff it is a placeholder ("Info
+    // volgt") and not a sale moment — do not count down then, or we suggest an
+    // opening time that means nothing.
+    const kickoff = asUtcDate(ev.EventStartDateTime);
+    const isPlaceholder = !!(till && kickoff && till.getTime() === kickoff.getTime());
     state.watch.opensAt = (open || isPlaceholder) ? null : till;
 
     const el = (tag, cls, text) => {
@@ -711,12 +709,11 @@
       if (text != null) n.textContent = text;
       return n;
     };
-    const kickoff = asUtcDate(ev.EventStartDateTime);
     card.appendChild(el('div', 'nts-wc-title',
       ev.Name + (kickoff ? ' · ' + fmtLocal(kickoff) : '')));
 
-    // Eén statusregel. Staat er een aftelling, dan is dát de kop; anders de
-    // betekenis van de knop.
+    // A single status line. If there is a countdown that is the headline;
+    // otherwise the meaning of the button.
     const code = buttonCode(ev);
     const label = pick(ev, 'ButtonData.TranslationCode');
     const status = el('div', 'nts-wc-status' + (open ? ' nts-wc-open' : ''));
@@ -726,7 +723,7 @@
     status.appendChild(ui.watchCountdown);
     card.appendChild(status);
 
-    // Het eigen label van de club alleen tonen als het iets toevoegt.
+    // Only show the club's own label when it adds something.
     if (label && !STATUS_TEXT[label]) {
       const b = el('div', 'nts-wc-button', label);
       if (till) b.title = 'omslag ' + fmtLocal(till) + '  (API: ' +
@@ -734,31 +731,31 @@
       card.appendChild(b);
     }
 
-    // Eén cijferregel. "plaatsen" laten we weg: dat zijn prijscategorieën,
-    // geen kaarten, en het wekte juist de indruk dat er 31 kaarten waren.
-    const delen = [];
+    // One figures line. "placements" is left out: those are price categories,
+    // not tickets, and it gave the impression there were only 31 tickets.
+    const parts = [];
     if (vs) {
-      delen.push(vs.sections + ' vak' + (vs.sections === 1 ? '' : 'ken'));
-      delen.push(vs.available == null ? 'nog geen kaarten' : vs.available + ' vrij');
+      parts.push(vs.sections + ' vak' + (vs.sections === 1 ? '' : 'ken'));
+      parts.push(vs.available == null ? 'nog geen kaarten' : vs.available + ' vrij');
       const pr = priceLabel(vs);
-      if (pr) delen.push(pr);
+      if (pr) parts.push(pr);
     }
-    if (delen.length) {
+    if (parts.length) {
       const m = el('div', 'nts-wc-metrics');
-      m.appendChild(el('span', 'nts-wc-m' + (vs.available ? ' nts-wc-strong' : ''), delen[0] + ' · ' + delen[1]));
-      if (delen[2]) m.appendChild(el('span', 'nts-wc-m nts-wc-dim', delen[2]));
+      m.appendChild(el('span', 'nts-wc-m' + (vs.available ? ' nts-wc-strong' : ''), parts[0] + ' · ' + parts[1]));
+      if (parts[2]) m.appendChild(el('span', 'nts-wc-m nts-wc-dim', parts[2]));
       card.appendChild(m);
     }
 
-    // Alleen vlaggen die iets betekenen. "nee" op zes rijen is ruis.
-    const bijzonder = [];
-    if (ev.PurchaseRightAvailableAfterLogin === true) bijzonder.push('kooprecht na inloggen');
-    if (ev.HasSoldOut === true) bijzonder.push('uitverkocht');
-    if (ev.HasMarketplaceTicketsAvailable === true) bijzonder.push('marktplaats');
-    if (ev.SalesFlowAllowed === false) bijzonder.push('verkoopflow geblokkeerd');
-    if (bijzonder.length) {
+    // Only flags that mean something. Six rows of "no" is noise.
+    const notable = [];
+    if (ev.PurchaseRightAvailableAfterLogin === true) notable.push('kooprecht na inloggen');
+    if (ev.HasSoldOut === true) notable.push('uitverkocht');
+    if (ev.HasMarketplaceTicketsAvailable === true) notable.push('marktplaats');
+    if (ev.SalesFlowAllowed === false) notable.push('verkoopflow geblokkeerd');
+    if (notable.length) {
       const f = el('div', 'nts-wc-flags');
-      bijzonder.forEach(t => f.appendChild(el('span', 'nts-wc-flag', t)));
+      notable.forEach(t => f.appendChild(el('span', 'nts-wc-flag', t)));
       card.appendChild(f);
     }
 
@@ -766,13 +763,13 @@
     updateCountdown();
   }
 
-  // De kaart hoort er te staan zodra je een event kiest, in beide modi. Het
-  // venue-antwoord hebben we bij het laden van de vakken al, dus dat geven we
-  // door in plaats van het nog eens op te halen.
+  // The card should appear as soon as you pick an event. We already have the
+  // venue response from loading the sections, so pass it in rather than
+  // fetching it a second time.
   function clearEventCard() {
     ui.watchCard.innerHTML = '';
-    ui.watchCountdown = null;          // anders schrijft de aftelling naar een
-    state.watch.opensAt = null;        // element dat niet meer in de DOM hangt
+    ui.watchCountdown = null;          // otherwise the countdown keeps writing
+    state.watch.opensAt = null;        // to an element no longer in the DOM
   }
 
   async function showEventCard(venue) {
@@ -787,7 +784,7 @@
     }
   }
 
-  // Loopt elke seconde zodat de aftelling niet 30s stilstaat.
+  // Runs every second so the countdown does not sit still for 30s.
   function updateCountdown() {
     if (!ui.watchCountdown) return;
     const at = state.watch.opensAt;
@@ -796,8 +793,8 @@
     ui.watchCountdown.textContent = d ? 'opent over ' + d : 'omslagmoment verstreken';
   }
 
-  // Wijzigingen in het event-record melden. De beginstand staat in de kaart,
-  // dus het log is er alleen voor wat er verandert.
+  // Report changes in the event record. The initial state is in the card, so
+  // the log is only there for what changes.
   function reportEventChanges(ev) {
     const now = snapshot(ev);
     const prev = state.watch.prev;
@@ -821,8 +818,8 @@
     }
   }
 
-  // Wijzigingen aan de plattegrond-kant. Het verschijnen van vakken is bij een
-  // uitwedstrijd het moment waarop er echt iets te halen valt.
+  // Changes on the venue side. For an away fixture, sections appearing is the
+  // moment there is genuinely something to take.
   function reportVenueChanges(vs) {
     const pv = state.watch.prevVenue;
     if (pv) {
@@ -842,24 +839,24 @@
     log('🎉 VERKOOP OPEN voor "' + ev.Name + '" — ga naar de shop!');
     const route = (ev.DeepLinkRoute || '').trim();
     let href = SHOP_URL;
-    try { if (route) href = new URL(route, SHOP_URL).href; } catch (e) { /* val terug op de shop-home */ }
+    try { if (route) href = new URL(route, SHOP_URL).href; } catch (e) { /* fall back to the shop home */ }
     showBanner('🎉 ' + ev.Name + ' is in verkoop!', 'Naar de shop →', href);
     beep();
     flashTitle('🎟️ IN VERKOOP');
 
-    // Misschien is er nu wél een plattegrond: dan kun je overstappen op de
-    // stoelenscan in plaats van handmatig klikken.
+    // There may be a venue map now, in which case the monitor can start
+    // claiming instead of you clicking manually.
     try {
       const venue = await getVenue(state.eventId);
       const secs = venue.Sections.filter(s => s.SaleCategoryId === state.eventCategory);
       if (secs.length) {
         log('🪑 Er is nu een plattegrond (' + secs.length + ' vak(ken)) — zet de modus op "Stoelen", ververs en start de scan.');
       }
-    } catch (e) { /* het alarm is al gegeven; dit is extra */ }
+    } catch (e) { /* the alarm has already fired; this is a bonus */ }
   }
 
-  // De tabtitel is het enige signaal dat je ook ziet als het tabblad op de
-  // achtergrond staat; de banner en de piep vereisen dat je kijkt/luistert.
+  // The tab title is the only signal you still notice when the tab is in the
+  // background; the banner and the beep require you to look or listen.
   function flashTitle(text) {
     if (state.watch.title === null) state.watch.title = document.title;
     document.title = text + ' · ' + state.watch.title;
@@ -877,7 +874,7 @@
     try {
       const raw = window.sessionStorage.getItem('shoppingCartData');
       if (raw) order = JSON.parse(raw);
-    } catch (e) { /* geen bestaande cart is prima */ }
+    } catch (e) { /* no existing cart is fine */ }
     state.cart = {
       reservationId: null, reservationUID: null,
       orderId: order.PendingOrderId || null, orderUID: order.PendingOrderUID || null,
@@ -894,10 +891,10 @@
     state.watch.loginWarned = false;
     ui.counter.textContent = 'Vrij nu: —';
 
-    const namen = state.selectedOrder.length
+    const names = state.selectedOrder.length
       ? state.selectedOrder.map((v, i) => (i + 1) + '. ' + nameByVbb(v)).join('  ')
       : (state.sections.length ? 'alle vakken' : 'nog geen vakken — we wachten tot ze verschijnen');
-    log('▶️ Gestart · ' + namen + ' · gewenst: ' + state.wantedCount);
+    log('▶️ Gestart · ' + names + ' · gewenst: ' + state.wantedCount);
     setRunning(true);
     tick();
     state.timer = setInterval(tick, INTERVAL_MS);
@@ -974,7 +971,7 @@
     renderSections();
   }
 
-  // --- Seat picker: per vak de rijen/stoelen tonen en specifieke stoelen kiezen.
+  // --- Seat picker: show the rows/seats per section and pick specific seats.
   async function openPicker(vbbId) {
     if (state.eventId == null) { log('Kies eerst een event.'); return; }
     log('Stoelen laden voor ' + nameByVbb(vbbId) + '…');
@@ -992,7 +989,7 @@
     const chosen = state.desiredSeats[vbbId] || (state.desiredSeats[vbbId] = new Set());
 
     // Group by seat number: real seats (P1) plus the "fake" numbered non-seats
-    // (P2/P3 = trap/gang) so the map blijft compleet. Lege padding overslaan.
+    // (P2/P3 = stairs/aisle) so the map stays complete. Skip empty padding.
     const byRow = new Map();
     seatData.Rows.forEach(r => r.Columns.forEach(c => {
       if (!c.SeatNumber) return;
@@ -1046,12 +1043,12 @@
         const cell = document.createElement('button');
         let cls = 'nts-seat';
         if (seat && chosen.has(c.Id)) cls += ' nts-seat-chosen';
-        else if (!seat) cls += ' nts-seat-nonseat';       // gangpad/trap: kruis
-        else if (!avail) cls += ' nts-seat-taken';        // bezette echte stoel
+        else if (!seat) cls += ' nts-seat-nonseat';       // aisle/stairs: cross
+        else if (!avail) cls += ' nts-seat-taken';        // occupied real seat
         cell.className = cls;
         cell.textContent = c.SeatNumber;
-        // Alleen nu-boekbare echte stoelen zijn klikbaar (een al gekozen stoel
-        // blijft klikbaar om af te vinken).
+        // Only currently bookable real seats are clickable (an already chosen
+        // seat stays clickable so it can be unpicked).
         const clickable = seat && (avail || chosen.has(c.Id));
         if (!clickable) {
           cell.disabled = true;
@@ -1102,8 +1099,8 @@
     try {
       log('Vakken laden…');
       const venue = await getVenue(eventId);
-      // Alle vakken van de categorie van dit event, alfabetisch. Ook volle
-      // vakken staan erin, zodat je ze kunt kiezen en de monitor blijft checken.
+      // All sections in this event's category, alphabetically. Full sections are
+      // included too, so you can pick them and the monitor keeps checking.
       const all = venue.Sections
         .filter(s => s.SaleCategoryId === state.eventCategory)
         .sort((a, b) => a.Name.localeCompare(b.Name, 'nl', { numeric: true }));
@@ -1118,7 +1115,7 @@
       }
       renderSections();
       showEventCard(venue);
-      // Wat voor event dit is hoef je niet te kiezen; het blijkt uit de vakken.
+      // You do not have to choose what kind of event this is; the sections say.
       state.lastSections = all.length;
       if (all.length === 0) {
         log('⏳ Nog geen vakken voor dit event — start gerust, de monitor pakt ze ' +
@@ -1162,7 +1159,7 @@
       gain.gain.value = 0.08;
       osc.start();
       setTimeout(() => { osc.stop(); ctx.close(); }, 500);
-    } catch (e) { /* geluid is optioneel */ }
+    } catch (e) { /* sound is optional */ }
   }
 
   function buildPanel() {
