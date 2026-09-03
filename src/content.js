@@ -1225,23 +1225,23 @@
   function buildPanel() {
     const panel = document.createElement('div');
     panel.id = 'nts-panel';
-    panel.innerHTML = [
-      '<div class="nts-head"><span>Seat Assist</span>',
-      '<span class="nts-token nts-bad">token…</span>',
-      '<button class="nts-collapse" title="in-/uitklappen">–</button></div>',
-      '<div class="nts-body">',
-      '  <div class="nts-row"><button class="nts-events">Events laden</button>',
-      '    <select class="nts-event"><option value="">— kies event —</option></select></div>',
-      '  <div class="nts-label">Vakken (klik = prioriteit, 🪑 = kies stoelen): <button class="nts-refresh" title="ververs vakken">↻</button></div>',
-      '  <div class="nts-sections"></div>',
-      '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label></div>',
-      '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>',
-      '  <div class="nts-watchcard"></div>',
-      '  <div class="nts-counter">Vrij nu: —</div>',
-      '  <div class="nts-log"></div>',
-      '</div>',
-      '<div class="nts-picker"></div>',
-    ].join('');
+    // Static markup only: the AMO linter flags any non-literal innerHTML.
+    panel.innerHTML =
+      '<div class="nts-head"><span>Seat Assist</span>' +
+      '<span class="nts-token nts-bad">token…</span>' +
+      '<button class="nts-collapse" title="in-/uitklappen">–</button></div>' +
+      '<div class="nts-body">' +
+      '  <div class="nts-row"><button class="nts-events">Events laden</button>' +
+      '    <select class="nts-event"><option value="">— kies event —</option></select></div>' +
+      '  <div class="nts-label">Vakken (klik = prioriteit, 🪑 = kies stoelen): <button class="nts-refresh" title="ververs vakken">↻</button></div>' +
+      '  <div class="nts-sections"></div>' +
+      '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label></div>' +
+      '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>' +
+      '  <div class="nts-watchcard"></div>' +
+      '  <div class="nts-counter">Vrij nu: —</div>' +
+      '  <div class="nts-log"></div>' +
+      '</div>' +
+      '<div class="nts-picker"></div>';
     document.body.appendChild(panel);
 
     ui.panel = panel;
