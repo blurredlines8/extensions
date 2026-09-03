@@ -123,6 +123,12 @@
   border-radius: 999px;
   border: 1px solid transparent;
   white-space: nowrap;
+  /* The pill now carries "ingelogd · 14u 9m geldig"; never let it push the
+     collapse button out of the header on a narrow viewport. */
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
 }
 #nts-panel .nts-token.nts-ok {
   color: var(--nts-green-text);
