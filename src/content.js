@@ -27,6 +27,7 @@
     lastPoll: 0,               // timestamp of the previous round (for the wait mode)
     evRecord: null,            // most recently fetched event record
     evFetched: 0,
+    right: null,               // this customer's purchase right for the event (or null)
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -189,6 +190,25 @@
       log('  select-position error: ' + e.message);
       return 'error';
     }
+  }
+
+  // How many tickets this customer may buy for the event. A PUT, but it only
+  // answers; the shop fires it on every event selection. Body derived from the
+  // bundle (initializeEventSelection). Returns the first right or null.
+  // Observed: AmountSelectable is the sum over PurchaseRightsPerCustomer
+  // (6 managed customers × 4 = 24 on a home fixture); [] means no right yet.
+  async function getPurchaseRight(eventId) {
+    const res = await fetch(API + '/v2/PurchaseRight/for-event', {
+      method: 'PUT', credentials: 'omit', headers: headers(),
+      body: JSON.stringify({
+        EventId: eventId, SaleCategoryIds: state.eventCategory != null ? [state.eventCategory] : null,
+        PendingOrderId: state.cart.orderId, PendingOrderUID: state.cart.orderUID,
+        InitiativeGuid: getInitiativeGuid(),
+      }),
+    });
+    if (!res.ok) throw new Error('PurchaseRight HTTP ' + res.status);
+    const list = await res.json();
+    return Array.isArray(list) && list.length ? list[0] : null;
   }
 
   // Buy a spot in a section without seat numbers. Payload derived from the shop
@@ -399,16 +419,22 @@
 
     // In wait mode (no sections yet) every 5 seconds is pointless; this can go
     // on for days. Once sections exist we switch to full speed.
-    const nu = Date.now();
-    if (state.lastSections === 0 && state.lastPoll && nu - state.lastPoll < WAIT_INTERVAL_MS) return;
-    state.lastPoll = nu;
+    const now = Date.now();
+    if (state.lastSections === 0 && state.lastPoll && now - state.lastPoll < WAIT_INTERVAL_MS) return;
+    state.lastPoll = now;
 
     try {
       // The event record changes slowly; do not fetch it every round.
-      if (!state.evRecord || nu - state.evFetched > WAIT_INTERVAL_MS) {
+      if (!state.evRecord || now - state.evFetched > WAIT_INTERVAL_MS) {
         const fresh = (await getEventsRaw()).find(i => i.EventId === state.eventId);
         if (fresh) { reportEventChanges(fresh); state.evRecord = fresh; }
-        state.evFetched = nu;
+        state.evFetched = now;
+        try {
+          const r = await getPurchaseRight(state.eventId);
+          const was = state.right ? state.right.AmountSelectable : null;
+          state.right = r;
+          if (r && was !== r.AmountSelectable) log('🎟️ kooprecht: ' + showVal(was) + ' → ' + r.AmountSelectable + ' kaart(en)');
+        } catch (e) { /* no right info is not fatal; the card shows it as unknown */ }
       }
 
       const venue = await getVenue(state.eventId);
@@ -513,7 +539,14 @@
     const key = 'vak:' + section.VenueBuildingBlockId;
     if (state.cart.attempted.has(key)) return;
 
-    const wanted = state.wantedCount - state.cart.acquired;
+    let wanted = state.wantedCount - state.cart.acquired;
+    // Never ask for more than the purchase right allows; the API refuses the
+    // whole request rather than trimming it.
+    const r = state.right;
+    if (r && !r.UnlimitedAmount && Number.isFinite(r.AmountSelectable) && r.AmountSelectable < wanted) {
+      log('  kooprecht staat ' + r.AmountSelectable + ' toe; gewenst ' + wanted + ' — aantal verlaagd.');
+      wanted = r.AmountSelectable;
+    }
     if (wanted <= 0) return;
     const take = (available === null) ? wanted : Math.min(wanted, available);
     if (take <= 0) return;
@@ -751,10 +784,19 @@
       const pr = priceLabel(vs);
       if (pr) parts.push(pr);
     }
+    if (state.right) {
+      const r = state.right;
+      const per = (r.PurchaseRightsPerCustomer || []).length;
+      parts.push('mag kopen: ' + (r.UnlimitedAmount ? 'onbeperkt' : r.AmountSelectable) +
+        (per > 1 ? ' (' + per + ' personen)' : ''));
+    } else if (ev.CurrentlyOnSaleForUser === false) {
+      parts.push('mag kopen: nog geen recht');
+    }
     if (parts.length) {
       const m = el('div', 'nts-wc-metrics');
-      m.appendChild(el('span', 'nts-wc-m' + (vs.available ? ' nts-wc-strong' : ''), parts[0] + ' · ' + parts[1]));
-      if (parts[2]) m.appendChild(el('span', 'nts-wc-m nts-wc-dim', parts[2]));
+      m.appendChild(el('span', 'nts-wc-m' + (vs && vs.available ? ' nts-wc-strong' : ''),
+        parts.slice(0, 2).join(' · ')));
+      parts.slice(2).forEach(t => m.appendChild(el('span', 'nts-wc-m nts-wc-dim', t)));
       card.appendChild(m);
     }
 
@@ -789,6 +831,7 @@
       const ev = (await getEventsRaw()).find(i => i.EventId === state.eventId);
       if (!ev) { clearEventCard(); return; }
       const vs = summarisePlacements(venue || await getVenue(state.eventId));
+      try { state.right = await getPurchaseRight(state.eventId); } catch (e) { state.right = null; }
       renderWatchCard(ev, vs);
     } catch (e) {
       log('Kon de statuskaart niet laden: ' + e.message);
