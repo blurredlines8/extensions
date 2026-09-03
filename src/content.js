@@ -23,6 +23,7 @@
     mode: 'seats',         // 'seats' = stoelenscan, 'watch' = verkoopwacht
     modeAuto: false,       // modus is automatisch gezet (mag automatisch terug)
     watch: { timer: null, prev: null, alerted: false, title: null },
+    unplacedSeen: new Set(),   // vakken waarvan we de unplaced-vorm al logden
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -91,6 +92,44 @@
     });
     if (!res.ok) throw new Error('Section HTTP ' + res.status);
     return res.json();
+  }
+
+  // Vakken zonder genummerde stoelen (staanplaatsen, uitvakken) hebben een eigen
+  // endpoint. Payload afgeleid uit de shop-bundle (getUnplacedData).
+  async function getSectionUnplaced(vbbId, eventId) {
+    const res = await fetch(API + '/v2/Availability/section-unplaced', {
+      method: 'POST', credentials: 'omit', headers: headers(),
+      body: JSON.stringify({ ParentVBBId: vbbId, EventIds: [eventId], PassePartoutIds: null, InitiativeGuid: getInitiativeGuid() }),
+    });
+    if (!res.ok) throw new Error('SectionUnplaced HTTP ' + res.status);
+    return res.json();
+  }
+
+  // De shop stuurt hier de waarde uit sessionStorage['ai'] mee; wij deden dat nog
+  // niet. Bij kooprecht-verkopen kan dat uitmaken.
+  const getInitiativeGuid = () => {
+    try { return window.sessionStorage.getItem('ai') || null; } catch (e) { return null; }
+  };
+
+  // Zo bepaalt de shop het zelf: geen rijen terug = het is een unplaced vak.
+  const isUnplacedDetail = d => !d || !d.Rows || d.Rows.length === 0;
+
+  // Hoeveel er vrij is in een unplaced vak. De precieze vorm van Availability
+  // hebben we nog niet in het echt gezien, dus meerdere velden proberen en bij
+  // twijfel null teruggeven (dan tonen we "?" i.p.v. een verzonnen getal).
+  function countUnplaced(u) {
+    if (!u) return null;
+    const t = u.Details && u.Details.TicketsPerTicketTypeId;
+    if (t && typeof t === 'object') {
+      const n = Object.values(t).reduce((a, b) => a + (Number(b) || 0), 0);
+      if (Number.isFinite(n)) return n;
+    }
+    if (Array.isArray(u.Availability) && u.Availability.length) {
+      const n = u.Availability.reduce((a, x) =>
+        a + (Number(x.Amount ?? x.Available ?? x.AvailableCount ?? x.Count) || 0), 0);
+      if (n > 0) return n;
+    }
+    return null;
   }
 
   // Returns 'ok' | 'unavailable' (definitively gone/not allowed) | 'error' (retry).
@@ -311,12 +350,39 @@
       const currentKeys = new Set();
       for (const section of secs) {
         const detail = await getSection(section.VenueBuildingBlockId, state.eventId);
+
+        // Uitvakken/staanplaatsen leveren geen Rows. Vroeger liep tick() daar
+        // stuk op detail.Rows.flatMap; nu tonen we het aantal los.
+        if (isUnplacedDetail(detail)) {
+          let u = null;
+          try { u = await getSectionUnplaced(section.VenueBuildingBlockId, state.eventId); }
+          catch (e) { log('  section-unplaced ' + section.Name + ': ' + e.message); }
+          const n = countUnplaced(u);
+          if (!state.unplacedSeen.has(section.VenueBuildingBlockId)) {
+            state.unplacedSeen.add(section.VenueBuildingBlockId);
+            // Eén keer de ruwe vorm loggen: die hebben we nog nooit gevuld gezien.
+            log('🎫 ' + section.Name + ' is een vak zonder stoelnummers · ' +
+                (n === null ? 'aantal onbekend' : n + ' beschikbaar'));
+            if (u) log('   ruwe data: ' + JSON.stringify({
+              Availability: u.Availability,
+              TicketsPerTicketTypeId: u.Details && u.Details.TicketsPerTicketTypeId,
+              HasTicketsAvailable: u.Details && u.Details.HasTicketsAvailable,
+            }).slice(0, 400));
+          }
+          gathered.push({ section, seats: [], unplaced: n });
+          continue;
+        }
+
         const seats = detail.Rows
           .flatMap(r => r.Columns)
           .filter(c => isSeat(c) && (c.IsAvailableForSale === true || c.AvailableForSecondary === true));
         gathered.push({ section, seats });
         for (const c of seats) currentKeys.add(section.VenueBuildingBlockId + ':' + c.Id);
       }
+
+      const unplacedTotal = gathered.reduce((a, g) => a + (g.unplaced || 0), 0);
+      if (unplacedTotal) log('🎫 Zonder stoelnummer beschikbaar: ' + unplacedTotal +
+        ' — die pakt de extensie nog niet automatisch, koop ze in de shop.');
 
       updateChurn(currentKeys);
 
@@ -420,6 +486,26 @@
     (isDefaultButton(ev.ButtonData) &&
       DEFAULT_BUTTON_ONSALE.indexOf(ev.ButtonData.TranslationCode) >= 0);
 
+  // Uitwedstrijden geven Sections: [], maar Venue/venue verklapt wél hoeveel
+  // plaatsen er zijn en welke prijzen erop staan. Die prijzen worden ingevuld
+  // naarmate de verkoop nadert — een vroeg signaal, ruim vóór de knop omklapt.
+  function summarisePlacements(venue) {
+    const epf = (venue && venue.Filters && venue.Filters.EventPlacementFilters) || [];
+    const byPrice = new Map();
+    epf.forEach(x => {
+      if (x.BasePrice == null) return;
+      byPrice.set(x.BasePrice, (byPrice.get(x.BasePrice) || 0) + 1);
+    });
+    const tiers = [...byPrice.entries()].sort((a, b) => a[0] - b[0])
+      .map(([prijs, n]) => n + '× €' + prijs.toFixed(2));
+    return {
+      sections: (venue && venue.Sections ? venue.Sections.length : 0),
+      placements: epf.length,
+      priced: [...byPrice.values()].reduce((a, b) => a + b, 0),
+      tiers: tiers.join(' · ') || '—',
+    };
+  }
+
   const snapshot = ev => {
     const s = {};
     WATCH_FIELDS.forEach(([path]) => { s[path] = showVal(pick(ev, path)); });
@@ -450,11 +536,37 @@
       });
     }
 
+    // Ook de plattegrond-kant pollen: bij een uitwedstrijd is het verschijnen van
+    // vakken (of het invullen van prijzen) het eerste harde teken van leven.
+    let vs = null;
+    try {
+      vs = summarisePlacements(await getVenue(state.eventId));
+    } catch (e) { log('  venue-check: ' + e.message); }
+
+    if (vs) {
+      const pv = state.watch.prevVenue;
+      if (!pv) {
+        log('🗺️ ' + vs.sections + ' vak(ken) · ' + vs.placements + ' plaatsen · prijzen: ' + vs.tiers);
+      } else {
+        if (pv.sections !== vs.sections) log('🗺️ vakken: ' + pv.sections + ' → ' + vs.sections);
+        if (pv.priced !== vs.priced) log('💶 plaatsen met prijs: ' + pv.priced + ' → ' + vs.priced + ' (' + vs.tiers + ')');
+        if (pv.placements !== vs.placements) log('🗺️ plaatsen: ' + pv.placements + ' → ' + vs.placements);
+      }
+      // Van 0 naar >0 vakken betekent dat de stoelenscan bruikbaar wordt.
+      if (pv && pv.sections === 0 && vs.sections > 0) {
+        log('🪑 Er zijn nu vakken voor dit event — zet de modus op "Stoelen" en start de scan.');
+        beep();
+        flashTitle('🪑 VAKKEN');
+      }
+      state.watch.prevVenue = vs;
+    }
+
     const open = isOnSale(ev);
     const till = pick(ev, 'ButtonData.ActiveTill');
     ui.counter.textContent = (open ? '🎉 IN VERKOOP' : 'Nog dicht') +
       ' · knop: ' + showVal(pick(ev, 'ButtonData.TranslationCode')) +
       (till && !open ? ' (tot ' + till.replace('T', ' ') + ')' : '') +
+      (vs ? ' · ' + vs.sections + ' vak / ' + vs.tiers : '') +
       ' · gecheckt ' + nowStr();
     ui.counter.classList.toggle('nts-idle', !open);
 
@@ -498,6 +610,7 @@
     if (state.watch.timer) return;
     if (state.eventId == null) { log('Kies eerst een event.'); return; }
     state.watch.prev = null;
+    state.watch.prevVenue = null;
     state.watch.alerted = false;
     const ev = state.events.find(e => e.eventId === state.eventId);
     log('▶️ Verkoopwacht op "' + (ev ? ev.name : state.eventId) + '" · elke ' +
