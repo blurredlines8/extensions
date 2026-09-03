@@ -433,7 +433,12 @@
           const r = await getPurchaseRight(state.eventId);
           const was = state.right ? state.right.AmountSelectable : null;
           state.right = r;
-          if (r && was !== r.AmountSelectable) log('🎟️ kooprecht: ' + showVal(was) + ' → ' + r.AmountSelectable + ' kaart(en)');
+          if (r && was !== r.AmountSelectable) {
+            const per = (r.PurchaseRightsPerCustomer || []).length;
+            log('🎟️ kooprecht: ' + showVal(was) + ' → ' + r.AmountSelectable + ' kaart(en)' +
+                (per > 1 ? ' voor ' + per + ' personen' : '') +
+                (r.Transferable ? ' · overdraagbaar' : ' · op naam van de rechthebbende'));
+          }
         } catch (e) { /* no right info is not fatal; the card shows it as unknown */ }
       }
 
