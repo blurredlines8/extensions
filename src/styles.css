@@ -32,7 +32,7 @@
   bottom: 16px;
   width: 440px;
   max-width: calc(100vw - 32px);
-  max-height: 76vh;
+  max-height: 86vh;
   display: flex;
   flex-direction: column;
   z-index: 2147483647;
@@ -46,6 +46,15 @@
   box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
   overflow: hidden;
 }
+/* Geforceerde kleuren (systeem-hoogcontrast): laat het systeem winnen, maar
+   houd de vlakken uit elkaar met randen. */
+@media (forced-colors: active) {
+  #nts-panel,
+  #nts-panel .nts-watchcard,
+  #nts-panel .nts-sections,
+  #nts-panel .nts-log { border: 1px solid CanvasText; }
+}
+
 #nts-panel *,
 #nts-panel *::before,
 #nts-panel *::after { box-sizing: border-box; }
@@ -144,6 +153,7 @@
 
 /* Body */
 #nts-panel .nts-body {
+  min-height: 0;          /* nodig om binnen de flex-kolom te kunnen scrollen */
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -256,6 +266,7 @@
 
 /* Counter */
 #nts-panel .nts-counter {
+  flex: 0 0 auto;
   font-size: 12px;
   font-weight: 600;
   color: var(--nts-green-text);
@@ -277,6 +288,7 @@
 #nts-panel.nts-watchmode .nts-label,
 #nts-panel.nts-watchmode .nts-sections,
 #nts-panel.nts-watchmode .nts-countrow,
+#nts-panel.nts-watchmode .nts-counter,
 #nts-panel.nts-watchmode .nts-reload { display: none; }
 
 /* Verkoopwacht-statuskaart */
@@ -315,6 +327,9 @@
 
 /* Log */
 #nts-panel .nts-log {
+  /* Net als de vakkenlijst: zonder dit knijpt de flex-kolom het log weg tot
+     een streepje zodra de kaart erbij komt. De body scrollt dan maar. */
+  flex: 0 0 auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   line-height: 1.55;
