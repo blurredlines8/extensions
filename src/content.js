@@ -478,13 +478,20 @@
   // ActionType is dus onbruikbaar als alarmsignaal (-1 en 'Disabled' betekenen
   // allebei "niets te doen", null betekent alleen "geen eigen knop"). We gaan af
   // op de vlaggen, met de standaardknop als bevestiging.
-  const DEFAULT_BUTTON_ONSALE = ['BTN.SALE.BUYNOW', 'BTN.SALE.LOGINTOBUY'];
   const isDefaultButton = b => !!b && !b.Id;
+  const buttonCode = ev => (isDefaultButton(ev.ButtonData) ? ev.ButtonData.TranslationCode : null);
+
+  // BTN.SALE.LOGINTOBUY telt NIET als verkoop. Gemeten bij FC Eindhoven: hun
+  // uitwedstrijden staan op LOGINTOBUY met CurrentlyOnSaleForUser=false en
+  // PurchaseRightAvailableAfterLogin=true — "log in, misschien is er iets voor
+  // jou", geen koopmoment. Wij draaien binnen een ingelogde sessie, dus die
+  // knop betekent hier eerder dat de login weg is. Aparte melding, geen alarm.
   const isOnSale = ev =>
     ev.CurrentlyOnSaleForUser === true ||
     ev.HasGeneralSale === true ||
-    (isDefaultButton(ev.ButtonData) &&
-      DEFAULT_BUTTON_ONSALE.indexOf(ev.ButtonData.TranslationCode) >= 0);
+    buttonCode(ev) === 'BTN.SALE.BUYNOW';
+
+  const needsLogin = ev => buttonCode(ev) === 'BTN.SALE.LOGINTOBUY';
 
   // Uitwedstrijden geven Sections: [], maar Venue/venue verklapt wél hoeveel
   // plaatsen er zijn en welke prijzen erop staan. Die prijzen worden ingevuld
@@ -570,6 +577,12 @@
       ' · gecheckt ' + nowStr();
     ui.counter.classList.toggle('nts-idle', !open);
 
+    if (needsLogin(ev) && !state.watch.loginWarned) {
+      state.watch.loginWarned = true;
+      log('🔑 De shop zegt "inloggen om te kopen" — controleer of je sessie nog geldig is; ' +
+          'kooprechten zijn pas zichtbaar als je ingelogd bent.');
+    }
+
     if (open && !state.watch.alerted) {
       state.watch.alerted = true;
       onSaleOpen(ev);
@@ -612,6 +625,7 @@
     state.watch.prev = null;
     state.watch.prevVenue = null;
     state.watch.alerted = false;
+    state.watch.loginWarned = false;
     const ev = state.events.find(e => e.eventId === state.eventId);
     log('▶️ Verkoopwacht op "' + (ev ? ev.name : state.eventId) + '" · elke ' +
         (WATCH_INTERVAL_MS / 1000) + 's een check op /v2/Event');
