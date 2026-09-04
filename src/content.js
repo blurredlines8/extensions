@@ -922,8 +922,15 @@
     // not tickets, and it gave the impression there were only 31 tickets.
     const parts = [];
     if (vs) {
-      parts.push(vs.sections + ' vak' + (vs.sections === 1 ? '' : 'ken'));
-      parts.push(vs.available == null ? 'nog geen kaarten' : vs.available + ' vrij');
+      // An away allocation never gets sections; on sale it sells straight on
+      // the priced placements. Say that instead of "0 vakken · nog geen kaarten".
+      if (!vs.sections && open && vs.priced) {
+        parts.push('verkoop via ' + vs.priced + ' placement' + (vs.priced === 1 ? '' : 's'));
+        parts.push('aantal niet zichtbaar');
+      } else {
+        parts.push(vs.sections + ' vak' + (vs.sections === 1 ? '' : 'ken'));
+        parts.push(vs.available == null ? 'nog geen kaarten' : vs.available + ' vrij');
+      }
       const pr = priceLabel(vs);
       if (pr) parts.push(pr);
     }
