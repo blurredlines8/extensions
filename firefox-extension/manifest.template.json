@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Seat Assist",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "Monitort voorkeursvakken en zet zodra mogelijk een stoel in je winkelwagen. Draait binnen je ingelogde shop-sessie en pakt het token automatisch uit sessionStorage.",
   "permissions": [
     "__API_ORIGIN__/*",
