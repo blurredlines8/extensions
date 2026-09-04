@@ -345,7 +345,8 @@
         orderUID: state.cart.orderUID,
         placed: (state.cart.placed || []).map(p => ({
           section: { VenueBuildingBlockId: p.section.VenueBuildingBlockId, Name: p.section.Name },
-          col: { Row: p.col.Row, Column: p.col.Column, RowNumber: p.col.RowNumber, SeatNumber: p.col.SeatNumber, Id: p.col.Id },
+          spots: p.spots || null,
+          col: p.col ? { Row: p.col.Row, Column: p.col.Column, RowNumber: p.col.RowNumber, SeatNumber: p.col.SeatNumber, Id: p.col.Id } : null,
         })),
       }));
     } catch (e) { /* sessionStorage may fail; not fatal */ }
@@ -413,13 +414,18 @@
       // 3. Put the same seats back into the shopping cart.
       let back = 0;
       for (const p of placed) {
-        const r = await claimSeat(p.section, p.col);
+        // Spots (unplaced) are re-claimed by amount; seats by position.
+        const r = p.spots ? await claimUnplaced(p.section, p.spots) : await claimSeat(p.section, p.col);
         if (r === 'ok' && await placeInOrder()) {
           state.cart.placed.push(p);
           back++;
-          log('  ✓ opnieuw: ' + p.section.Name + ' rij ' + p.col.RowNumber + ' stoel ' + p.col.SeatNumber);
+          log('  ✓ opnieuw: ' + p.section.Name + (p.spots
+            ? ' ' + p.spots + ' plek(ken)'
+            : ' rij ' + p.col.RowNumber + ' stoel ' + p.col.SeatNumber));
         } else {
-          log('  ✗ mislukt/niet meer vrij: ' + p.section.Name + ' rij ' + p.col.RowNumber + ' stoel ' + p.col.SeatNumber);
+          log('  ✗ mislukt/niet meer vrij: ' + p.section.Name + (p.spots
+            ? ' ' + p.spots + ' plek(ken)'
+            : ' rij ' + p.col.RowNumber + ' stoel ' + p.col.SeatNumber));
         }
       }
       state.cart.acquired = state.cart.placed.length;
@@ -583,17 +589,31 @@
     const take = (available === null) ? wanted : Math.min(wanted, available);
     if (take <= 0) return;
 
-    log('➡️ Poging: ' + take + ' plek(ken) in ' + section.Name);
-    const result = await claimUnplaced(section, take);
-    if (result === 'unavailable') { state.cart.attempted.add(key); return; }
-    if (result !== 'ok') return;
+    // The API may refuse one big request (the per-person cap is 4) while
+    // accepting the same total in chunks: try whole, then 4 + remainder, then
+    // singles. Every OK adds to the same PendingReservation.
+    const plan = take <= 4 ? [take] : [4, take - 4];
+    let got = 0;
+    for (const chunk of plan) {
+      log('➡️ Poging: ' + chunk + ' plek(ken) in ' + section.Name);
+      const result = await claimUnplaced(section, chunk);
+      if (result === 'ok') { got += chunk; continue; }
+      if (result !== 'unavailable') break;                 // network/5xx: retry next round
+      if (chunk === 1) break;
+      for (let i = 0; i < chunk; i++) {                    // last resort: one by one
+        if (await claimUnplaced(section, 1) !== 'ok') break;
+        got++;
+      }
+      break;
+    }
+    if (!got) { state.cart.attempted.add(key); return; }
 
-    log('  · vastgehouden, in winkelwagen plaatsen…');
+    log('  · ' + got + ' vastgehouden, in winkelwagen plaatsen…');
     if (!await placeInOrder()) return;
-    state.cart.placed.push({ section, spots: take });
-    state.cart.acquired += take;
+    state.cart.placed.push({ section, spots: got });
+    state.cart.acquired += got;
     persistCart();
-    log('  ✓ In winkelwagen: ' + take + ' plek(ken) in ' + section.Name +
+    log('  ✓ In winkelwagen: ' + got + ' plek(ken) in ' + section.Name +
         ' (' + state.cart.acquired + '/' + state.wantedCount + ')');
     if (state.cart.acquired >= state.wantedCount) onSuccess();
   }
