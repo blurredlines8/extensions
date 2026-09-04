@@ -454,12 +454,16 @@
     // In wait mode (no sections yet) every 5 seconds is pointless; this can go
     // on for days. Once sections exist we switch to full speed.
     const now = Date.now();
-    if (state.lastSections === 0 && state.lastPoll && now - state.lastPoll < WAIT_INTERVAL_MS) return;
+    // Burst mode: from two minutes before the personal sale moment until two
+    // minutes after, poll at full speed so the first claim is not up to 30s late.
+    const opensAt = state.watch.opensAt ? state.watch.opensAt.getTime() : null;
+    const burst = opensAt != null && Math.abs(opensAt - now) < 2 * 60 * 1000;
+    if (state.lastSections === 0 && !burst && state.lastPoll && now - state.lastPoll < WAIT_INTERVAL_MS) return;
     state.lastPoll = now;
 
     try {
       // The event record changes slowly; do not fetch it every round.
-      if (!state.evRecord || now - state.evFetched > WAIT_INTERVAL_MS) {
+      if (!state.evRecord || burst || now - state.evFetched > WAIT_INTERVAL_MS) {
         const fresh = (await getEventsRaw()).find(i => i.EventId === state.eventId);
         if (fresh) { reportEventChanges(fresh); state.evRecord = fresh; }
         state.evFetched = now;
