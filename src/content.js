@@ -286,6 +286,39 @@
     }
   }
 
+  // The shop's path for an event that has no sections at all (the Juventus
+  // away allocation on sale day: CurrentlyOnSaleForUser true, Sections []).
+  // Payload from the bundle (findMySeat): Amount, EventId, EventPlacementIds —
+  // the priced placements from Venue/venue.Filters — and InitiativeGuid.
+  // Returns 'ok' | 'unavailable' | 'error' like claimSeat.
+  async function claimByPlacements(placementIds, amount) {
+    const body = {
+      Amount: amount,
+      EventId: state.eventId,
+      EventPlacementIds: placementIds,
+      InitiativeGuid: getInitiativeGuid(),
+      PendingReservationId: state.cart.reservationId,
+      PendingReservationUID: state.cart.reservationUID,
+    };
+    try {
+      const res = await fetch(API + '/v2/Availability/find-my-seat', {
+        method: 'POST', credentials: 'omit', headers: headers(), body: JSON.stringify(body),
+      });
+      if (!res.ok) { log('  find-my-seat HTTP ' + res.status); return 'error'; }
+      const data = await res.json();
+      if (data.ResultCode === 'OK' && data.UpdatedPendingReservation) {
+        state.cart.reservationId = data.UpdatedPendingReservation.PendingReservationId;
+        state.cart.reservationUID = data.UpdatedPendingReservation.PendingReservationUID;
+        return 'ok';
+      }
+      log('  ✗ find-my-seat: ' + (data.ResultCode || 'onbekend'));
+      return 'unavailable';
+    } catch (e) {
+      log('  find-my-seat error: ' + e.message);
+      return 'error';
+    }
+  }
+
   // Second half of the shop's own flow: move the held reservation into a
   // PendingOrder (the visible shopping cart). Without this the seat is reserved
   // server-side but never shows up in the cart. Returns true on success.
@@ -514,6 +547,12 @@
       }
 
       if (!secs.length) {
+        // No sections, but on sale for this customer: the shop then sells
+        // straight on the priced placements. That is the away-match case.
+        if (!vs.sections && state.evRecord && state.evRecord.CurrentlyOnSaleForUser === true) {
+          await claimSpotsByPlacements(venue);
+          return;
+        }
         ui.counter.textContent = vs.sections
           ? 'Nog niets vrij in je voorkeursvak(ken) · ' + nowStr()
           : 'Wachten op vakken · gecontroleerd ' + nowStr();
@@ -558,6 +597,42 @@
     } catch (e) {
       log('Fout: ' + e.message);
     }
+  }
+
+  // Away fixture without sections: claim on the priced EventPlacements. One
+  // attempt per round; on a definitive refusal try smaller amounts, since the
+  // purchase right here is per person (1 each) and not transferable.
+  async function claimSpotsByPlacements(venue) {
+    if (state.cart.done) return;
+    const epf = (venue.Filters && venue.Filters.EventPlacementFilters) || [];
+    const ids = epf.filter(x => x.BasePrice != null).map(x => x.EventPlacementId);
+    if (!ids.length) { ui.counter.textContent = 'Geen geprijsde placements · ' + nowStr(); return; }
+
+    let wanted = state.wantedCount - state.cart.acquired;
+    const r = state.right;
+    if (r && !r.UnlimitedAmount && Number.isFinite(r.AmountSelectable) && r.AmountSelectable < wanted) {
+      log('  kooprecht staat ' + r.AmountSelectable + ' toe; gewenst ' + wanted + ' — aantal verlaagd.');
+      wanted = r.AmountSelectable;
+    }
+    if (wanted <= 0) { ui.counter.textContent = 'Kooprecht op · ' + nowStr(); return; }
+    ui.counter.textContent = 'Kopen via placements ' + ids.join(',') + ' · ' + nowStr();
+
+    let got = 0;
+    for (const amount of [wanted, Math.min(4, wanted), 1].filter((v, i, a) => v > 0 && a.indexOf(v) === i)) {
+      log('➡️ Poging: ' + amount + ' plek(ken) via find-my-seat');
+      const res = await claimByPlacements(ids, amount);
+      if (res === 'ok') { got = amount; break; }
+      if (res !== 'unavailable') return;              // retry next round
+    }
+    if (!got) return;
+
+    log('  · ' + got + ' vastgehouden, in winkelwagen plaatsen…');
+    if (!await placeInOrder()) return;
+    state.cart.placed.push({ section: { VenueBuildingBlockId: null, Name: 'placements ' + ids.join('/') }, spots: got, placementIds: ids });
+    state.cart.acquired += got;
+    persistCart();
+    log('  ✓ In winkelwagen: ' + got + ' plek(ken) (' + state.cart.acquired + '/' + state.wantedCount + ')');
+    if (state.cart.acquired >= state.wantedCount || (r && state.cart.acquired >= r.AmountSelectable)) onSuccess();
   }
 
   // Home fixture: seat by seat, in the priority order you picked.
