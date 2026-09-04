@@ -29,6 +29,7 @@
     evFetched: 0,
     right: null,               // this customer's purchase right for the event (or null)
     session: { wasCustomer: false, lastRefresh: 0 },
+    categoryRelaxedLogged: false,
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -481,8 +482,20 @@
       reportVenueChanges(vs);
       state.lastSections = vs.sections;
 
+      // Never observed which SaleCategoryId an away section carries. With only a
+      // few sections in the venue (an away allocation) the category filter is
+      // more likely to hide the section than to protect us, so relax it there
+      // and say so once.
+      const relaxCategory = venue.Sections.length <= 3;
+      if (relaxCategory && !state.categoryRelaxedLogged &&
+          venue.Sections.some(s => s.SaleCategoryId !== state.eventCategory)) {
+        state.categoryRelaxedLogged = true;
+        log('ℹ️ Vak(ken) met afwijkende SaleCategoryId (' +
+            [...new Set(venue.Sections.map(s => s.SaleCategoryId))].join(',') +
+            ' i.p.v. ' + state.eventCategory + ') — toch meegenomen, het zijn er maar ' + venue.Sections.length + '.');
+      }
       const isAvail = s =>
-        s.SaleCategoryId === state.eventCategory &&
+        (relaxCategory || s.SaleCategoryId === state.eventCategory) &&
         (s.HasTicketsAvailable === true || s.HasMarketplaceTicketsAvailable === true);
 
       let secs;
@@ -1208,8 +1221,9 @@
       const venue = await getVenue(eventId);
       // All sections in this event's category, alphabetically. Full sections are
       // included too, so you can pick them and the monitor keeps checking.
+      const relax = venue.Sections.length <= 3;
       const all = venue.Sections
-        .filter(s => s.SaleCategoryId === state.eventCategory)
+        .filter(s => relax || s.SaleCategoryId === state.eventCategory)
         .sort((a, b) => a.Name.localeCompare(b.Name, 'nl', { numeric: true }));
       state.sections = all;
       if (preserve) {
