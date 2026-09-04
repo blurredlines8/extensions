@@ -292,13 +292,12 @@
   // the priced placements from Venue/venue.Filters — and InitiativeGuid.
   // Returns 'ok' | 'unavailable' | 'error' like claimSeat.
   async function claimByPlacements(placementIds, amount) {
+    // Exactly the shop's payload — no extra fields on sale day.
     const body = {
       Amount: amount,
       EventId: state.eventId,
       EventPlacementIds: placementIds,
       InitiativeGuid: getInitiativeGuid(),
-      PendingReservationId: state.cart.reservationId,
-      PendingReservationUID: state.cart.reservationUID,
     };
     try {
       const res = await fetch(API + '/v2/Availability/find-my-seat', {
