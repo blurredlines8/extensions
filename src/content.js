@@ -30,6 +30,7 @@
     right: null,               // this customer's purchase right for the event (or null)
     session: { wasCustomer: false, lastRefresh: 0 },
     categoryRelaxedLogged: false,
+    priceGroupsLogged: false,
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -604,8 +605,21 @@
   async function claimSpotsByPlacements(venue) {
     if (state.cart.done) return;
     const epf = (venue.Filters && venue.Filters.EventPlacementFilters) || [];
-    const ids = epf.filter(x => x.BasePrice != null).map(x => x.EventPlacementId);
-    if (!ids.length) { ui.counter.textContent = 'Geen geprijsde placements · ' + nowStr(); return; }
+    const priced = epf.filter(x => x.BasePrice != null);
+    if (!priced.length) { ui.counter.textContent = 'Geen geprijsde placements · ' + nowStr(); return; }
+    // Placements come in price groups (Cambuur: 5× €40,50 and 1× €22,00 — the
+    // odd one is a reduced rate). Passing all ids at once lets find-my-seat hand
+    // out a rate you may not be entitled to, so try the largest group first and
+    // only then the rest. Juventus had a single group, so this was invisible.
+    const byPrice = new Map();
+    priced.forEach(x => byPrice.set(x.BasePrice, [...(byPrice.get(x.BasePrice) || []), x.EventPlacementId]));
+    const groups = [...byPrice.entries()].sort((a, b) => b[1].length - a[1].length || b[0] - a[0]);
+    const ids = groups[0][1];
+    if (groups.length > 1 && !state.priceGroupsLogged) {
+      state.priceGroupsLogged = true;
+      log('💶 ' + groups.map(([p, g]) => g.length + '× €' + p.toFixed(2)).join(' · ') +
+          ' — eerst de grootste groep (€' + groups[0][0].toFixed(2) + ').');
+    }
 
     let wanted = state.wantedCount - state.cart.acquired;
     const r = state.right;
@@ -617,11 +631,15 @@
     ui.counter.textContent = 'Kopen via placements ' + ids.join(',') + ' · ' + nowStr();
 
     let got = 0;
-    for (const amount of [wanted, Math.min(4, wanted), 1].filter((v, i, a) => v > 0 && a.indexOf(v) === i)) {
-      log('➡️ Poging: ' + amount + ' plek(ken) via find-my-seat');
-      const res = await claimByPlacements(ids, amount);
-      if (res === 'ok') { got = amount; break; }
-      if (res !== 'unavailable') return;              // retry next round
+    const amounts = [wanted, Math.min(4, wanted), 1].filter((v, i, a) => v > 0 && a.indexOf(v) === i);
+    outer:
+    for (const [price, groupIds] of groups) {
+      for (const amount of amounts) {
+        log('➡️ Poging: ' + amount + ' plek(ken) à €' + price.toFixed(2) + ' via find-my-seat');
+        const res = await claimByPlacements(groupIds, amount);
+        if (res === 'ok') { got = amount; break outer; }
+        if (res !== 'unavailable') return;            // network/5xx: retry next round
+      }
     }
     if (!got) return;
 
