@@ -31,6 +31,12 @@
     session: { wasCustomer: false, lastRefresh: 0 },
     categoryRelaxedLogged: false,
     priceGroupsLogged: false,
+    flowSteps: {},             // eventId -> SaleFlow steps (never change)
+    prevAway: null,            // previous away-section counts, for change detection
+    awaySections: [],          // named away sections from the cross-sell step
+    selectedAway: [],          // VenueBuildingBlockIds in click order
+    tryEarly: false,           // attempt a claim before your own sale phase
+    earlyLogged: false,
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -287,6 +293,47 @@
     }
   }
 
+  // The away-match flow is defined by SaleFlow steps; the cross-sell step lists
+  // the actual sections (coaches, car combi) with names, prices, availability
+  // AND their VenueBuildingBlockId — no reservation needed. Found from a HAR on
+  // 2026-09-09; the path is built in a variable in the bundle, which is why an
+  // earlier scan for `basePath}/v2/...` missed it and 130 other endpoints.
+  async function getSaleFlowSteps(eventId) {
+    const res = await fetch(API + '/v2/SaleFlow/' + state.eventCategory + '/' + eventId, {
+      credentials: 'omit', headers: headers(),
+    });
+    if (!res.ok) throw new Error('SaleFlow HTTP ' + res.status);
+    return res.json();
+  }
+
+  // GET /v2/SaleFlow/cross-sell/{saleCategoryId}/{eventId}/{stepId}
+  async function getCrossSellSections(eventId, stepId) {
+    const res = await fetch(API + '/v2/SaleFlow/cross-sell/' + state.eventCategory +
+      '/' + eventId + '/' + stepId, { credentials: 'omit', headers: headers() });
+    if (!res.ok) throw new Error('cross-sell HTTP ' + res.status);
+    return res.json();
+  }
+
+  // Everything the away flow needs, in two reads. Returns [] when this event
+  // has no cross-sell step (a normal home fixture).
+  async function loadAwaySections(eventId) {
+    // The flow steps never change for an event, so fetch them once and keep
+    // them; only the cross-sell list needs re-reading every round.
+    let steps = state.flowSteps[eventId];
+    if (!steps) {
+      try { steps = await getSaleFlowSteps(eventId); } catch (e) { return []; }
+      if (Array.isArray(steps) && steps.length) state.flowSteps[eventId] = steps;
+    }
+    if (!Array.isArray(steps) || !steps.length) return [];
+    for (const step of steps) {
+      try {
+        const list = await getCrossSellSections(eventId, step.Id);
+        if (Array.isArray(list) && list.length) return list;
+      } catch (e) { /* try the next step */ }
+    }
+    return [];
+  }
+
   // The shop's path for an event that has no sections at all (the Juventus
   // away allocation on sale day: CurrentlyOnSaleForUser true, Sections []).
   // Payload from the bundle (findMySeat): Amount, EventId, EventPlacementIds —
@@ -307,8 +354,16 @@
       if (!res.ok) { log('  find-my-seat HTTP ' + res.status); return 'error'; }
       const data = await res.json();
       if (data.ResultCode === 'OK' && data.UpdatedPendingReservation) {
-        state.cart.reservationId = data.UpdatedPendingReservation.PendingReservationId;
-        state.cart.reservationUID = data.UpdatedPendingReservation.PendingReservationUID;
+        const r = data.UpdatedPendingReservation;
+        state.cart.reservationId = r.PendingReservationId;
+        state.cart.reservationUID = r.PendingReservationUID;
+        // Only now do we learn what we actually got. For an away fixture the
+        // "placement" turns out to be a coach: ParentSectionName is "Bus 6"
+        // and the line carries a ParentVenueBuildingBlockId that never appears
+        // in Venue/venue. Worth showing — you may care which coach you are on.
+        const what = [...new Set((r.Lines || []).map(l =>
+          [l.ParentSectionName, l.TicketTypeName].filter(Boolean).join(' · ')))].filter(Boolean);
+        if (what.length) log('  🚌 ' + what.join(' | '));
         return 'ok';
       }
       log('  ✗ find-my-seat: ' + (data.ResultCode || 'onbekend'));
@@ -380,6 +435,7 @@
         placed: (state.cart.placed || []).map(p => ({
           section: { VenueBuildingBlockId: p.section.VenueBuildingBlockId, Name: p.section.Name },
           spots: p.spots || null,
+          placementIds: p.placementIds || null,
           col: p.col ? { Row: p.col.Row, Column: p.col.Column, RowNumber: p.col.RowNumber, SeatNumber: p.col.SeatNumber, Id: p.col.Id } : null,
         })),
       }));
@@ -448,8 +504,14 @@
       // 3. Put the same seats back into the shopping cart.
       let back = 0;
       for (const p of placed) {
-        // Spots (unplaced) are re-claimed by amount; seats by position.
-        const r = p.spots ? await claimUnplaced(p.section, p.spots) : await claimSeat(p.section, p.col);
+        // Three shapes: a placement claim (away match, no section id at all), a
+        // spot in a real section, or a numbered seat. Re-claiming a placement
+        // entry through unplaced-event-selection sends a null building block
+        // and the API answers 500 — that emptied a cart on 2026-09-09.
+        const r = p.placementIds && p.placementIds.length
+          ? await claimByPlacements(p.placementIds, p.spots)
+          : p.spots ? await claimUnplaced(p.section, p.spots)
+          : await claimSeat(p.section, p.col);
         if (r === 'ok' && await placeInOrder()) {
           state.cart.placed.push(p);
           back++;
@@ -517,6 +579,8 @@
       const vs = summarisePlacements(venue);
       if (state.evRecord) renderWatchCard(state.evRecord, vs);
       reportVenueChanges(vs);
+      // Set from the venue here; the away branch below overrides it when it
+      // finds free cross-sell sections.
       state.lastSections = vs.sections;
 
       // Never observed which SaleCategoryId an away section carries. With only a
@@ -549,7 +613,32 @@
       if (!secs.length) {
         // No sections, but on sale for this customer: the shop then sells
         // straight on the priced placements. That is the away-match case.
-        if (!vs.sections && state.evRecord && state.evRecord.CurrentlyOnSaleForUser === true) {
+        // Verified 2026-09-09: find-my-seat is not gated server-side, so a
+        // reservation succeeds before your own phase opens. Paying will still
+        // fail, so this stays opt-in via the "vóór mijn moment" checkbox.
+        const onSale = state.evRecord.CurrentlyOnSaleForUser === true;
+        if (!vs.sections) {
+          // Named sections with their own VenueBuildingBlockId and availability.
+          const away = await loadAwaySections(state.eventId);
+          reportAwayChanges(away);
+          if (away.length) {
+            state.awaySections = away;
+            renderAwaySections(away);
+            const vrij = away.filter(a => a.HasAvailability).length;
+            // Free away sections count as "there is something here", so the
+            // monitor leaves wait mode and polls at full speed.
+            state.lastSections = vrij;
+            if (onSale || state.tryEarly) { await claimAwaySection(away); return; }
+            ui.counter.textContent = vrij + '/' + away.length + ' secties vrij · ' + nowStr();
+            return;
+          }
+        }
+        if (!vs.sections && (onSale || (state.tryEarly && vs.priced > 0))) {
+          if (!onSale && !state.earlyLogged) {
+            state.earlyLogged = true;
+            log('⏱ Vóór je koopmoment: proberen te reserveren. Afrekenen lukt pas ' +
+                'vanaf je eigen fase.');
+          }
           await claimSpotsByPlacements(venue);
           return;
         }
@@ -596,6 +685,46 @@
       }
     } catch (e) {
       log('Fout: ' + e.message);
+    }
+  }
+
+  // Claim in a named away section. The section carries a VenueBuildingBlockId,
+  // so unplaced-event-selection applies — the same call the shop's own coach
+  // picker makes. Honours your click order; otherwise first available.
+  async function claimAwaySection(sections) {
+    if (state.cart.done) return;
+    const order = state.selectedAway.length
+      ? state.selectedAway.map(id => sections.find(a => a.VenueBuildingBlockId === id)).filter(Boolean)
+      : sections;
+    const open = order.filter(a => a.HasAvailability);
+    if (!open.length) { ui.counter.textContent = 'Niets vrij in je secties · ' + nowStr(); return; }
+
+    let wanted = state.wantedCount - state.cart.acquired;
+    const r = state.right;
+    if (r && !r.UnlimitedAmount && Number.isFinite(r.AmountSelectable) && r.AmountSelectable < wanted) {
+      log('  kooprecht staat ' + r.AmountSelectable + ' toe; gewenst ' + wanted + ' — aantal verlaagd.');
+      wanted = r.AmountSelectable;
+    }
+    if (wanted <= 0) { ui.counter.textContent = 'Kooprecht op · ' + nowStr(); return; }
+
+    for (const sec of open) {
+      if (state.cart.done) break;
+      const key = 'away:' + sec.VenueBuildingBlockId;
+      if (state.cart.attempted.has(key)) continue;
+      const naam = sec.ProductName || sec.ProductShortName || String(sec.VenueBuildingBlockId);
+      log('➡️ Poging: ' + wanted + '× ' + naam + ' (€' +
+          ((sec.Price || {}).PriceIncVat || 0).toFixed(2) + ')');
+      const res = await claimUnplaced({ VenueBuildingBlockId: sec.VenueBuildingBlockId, Name: naam }, wanted);
+      if (res === 'unavailable') { state.cart.attempted.add(key); continue; }
+      if (res !== 'ok') return;
+      log('  · vastgehouden, in winkelwagen plaatsen…');
+      if (!await placeInOrder()) return;
+      state.cart.placed.push({ section: { VenueBuildingBlockId: sec.VenueBuildingBlockId, Name: naam }, spots: wanted });
+      state.cart.acquired += wanted;
+      persistCart();
+      log('  ✓ In winkelwagen: ' + wanted + '× ' + naam + ' (' + state.cart.acquired + '/' + state.wantedCount + ')');
+      if (state.cart.acquired >= state.wantedCount) onSuccess();
+      return;
     }
   }
 
@@ -819,6 +948,12 @@
       byPrice.set(x.BasePrice, (byPrice.get(x.BasePrice) || 0) + 1);
     });
     const prices = [...byPrice.entries()].sort((a, b) => a[0] - b[0]);
+    const grouped = new Map();
+    epf.forEach(x => {
+      if (x.BasePrice == null) return;
+      grouped.set(x.BasePrice, [...(grouped.get(x.BasePrice) || []), x.EventPlacementId]);
+    });
+    const idsByPrice = [...grouped.entries()].sort((a, b) => b[1].length - a[1].length || b[0] - a[0]);
     const tiers = prices.map(([prijs, n]) => n + '× €' + prijs.toFixed(2));
     const secs = (venue && venue.Sections) || [];
     const available = secs.reduce((a, x) => {
@@ -831,6 +966,7 @@
       placements: epf.length,
       priced: [...byPrice.values()].reduce((a, b) => a + b, 0),
       prices,
+      byPrice: idsByPrice,
       tiers: tiers.join(' · ') || '—',
     };
   }
@@ -882,7 +1018,15 @@
     const p = vs.prices;
     if (p.length <= 2) return p.map(([prijs, n]) => n + '× €' + prijs.toFixed(2)).join(' · ');
     const lo = p[0][0], hi = p[p.length - 1][0];
-    return '€' + lo.toFixed(2) + ' – €' + hi.toFixed(2) + ' (' + p.length + " staffels)";
+    return '€' + lo.toFixed(2) + ' – €' + hi.toFixed(2) + ' (' + p.length + ' staffels)';
+  }
+
+  // Placement ids per price group. Only shown for an away fixture that has no
+  // cross-sell sections; when those exist they carry the real names instead.
+  function placementLines(vs) {
+    if (!vs || !vs.byPrice) return [];
+    return vs.byPrice.map(([prijs, ids]) =>
+      ids.length + '× €' + prijs.toFixed(2) + ' · ' + ids.join(', '));
   }
 
   function renderWatchCard(ev, vs) {
@@ -942,7 +1086,13 @@
     if (vs) {
       // An away allocation never gets sections; on sale it sells straight on
       // the priced placements. Say that instead of "0 vakken · nog geen kaarten".
-      if (!vs.sections && open && vs.priced) {
+      // An away fixture has no venue sections; show the cross-sell ones instead
+      // so the card does not say "0 vakken" while the counter says "8/11 vrij".
+      if (!vs.sections && state.awaySections.length) {
+        const vrij = state.awaySections.filter(a => a.HasAvailability).length;
+        parts.push(state.awaySections.length + ' sectie' + (state.awaySections.length === 1 ? '' : 's'));
+        parts.push(vrij + ' vrij');
+      } else if (!vs.sections && open && vs.priced) {
         parts.push('verkoop via ' + vs.priced + ' placement' + (vs.priced === 1 ? '' : 's'));
         parts.push('aantal niet zichtbaar');
       } else {
@@ -962,7 +1112,8 @@
     }
     if (parts.length) {
       const m = el('div', 'nts-wc-metrics');
-      m.appendChild(el('span', 'nts-wc-m' + (vs && vs.available ? ' nts-wc-strong' : ''),
+      const iets = (vs && vs.available) || state.awaySections.some(a => a.HasAvailability);
+      m.appendChild(el('span', 'nts-wc-m' + (iets ? ' nts-wc-strong' : ''),
         parts.slice(0, 2).join(' · ')));
       parts.slice(2).forEach(t => m.appendChild(el('span', 'nts-wc-m nts-wc-dim', t)));
       card.appendChild(m);
@@ -980,6 +1131,7 @@
       card.appendChild(f);
     }
 
+    placementLines(vs).forEach(t => card.appendChild(el('div', 'nts-wc-pl', t)));
     card.appendChild(el('div', 'nts-wc-foot', 'laatste check ' + nowStr()));
     updateCountdown();
   }
@@ -1038,6 +1190,26 @@
     if (isOnSale(ev) && !state.watch.alerted) {
       state.watch.alerted = true;
       onSaleOpen(ev);
+    }
+  }
+
+  // Away sections come from the cross-sell step, not from Venue/venue, so they
+  // need their own comparison. Going from none to some is the moment that
+  // matters for an away fixture — it is the equivalent of sections appearing.
+  function reportAwayChanges(away) {
+    const now = { total: away.length, free: away.filter(a => a.HasAvailability).length };
+    const prev = state.prevAway;
+    state.prevAway = now;
+    if (!prev) {
+      if (now.total) log('🚌 ' + now.total + ' sectie(s), ' + now.free + ' vrij.');
+      return;
+    }
+    if (prev.total !== now.total) log('🚌 secties: ' + prev.total + ' → ' + now.total);
+    if (prev.free !== now.free) log('🎫 vrij: ' + prev.free + ' → ' + now.free);
+    if (prev.free === 0 && now.free > 0) {
+      log('🚌 Er is nu plek — de monitor gaat over op kopen.');
+      beep();
+      flashTitle('🚌 PLEK VRIJ');
     }
   }
 
@@ -1183,6 +1355,31 @@
       seatBtn.addEventListener('click', (e) => { e.stopPropagation(); openPicker(vbb); });
 
       row.append(label, seatBtn);
+      ui.sections.appendChild(row);
+    });
+  }
+
+  // Away sections are clickable exactly like home sections: click = priority.
+  function renderAwaySections(list) {
+    ui.sections.innerHTML = '';
+    list.forEach(a => {
+      const vbb = a.VenueBuildingBlockId;
+      const idx = state.selectedAway.indexOf(vbb);
+      const row = document.createElement('div');
+      row.className = 'nts-sec' + (idx >= 0 ? ' nts-sel' : '') + (a.HasAvailability ? '' : ' nts-full');
+      const label = document.createElement('span');
+      label.className = 'nts-sec-label';
+      const prijs = (a.Price || {}).PriceIncVat;
+      label.textContent = (idx >= 0 ? (idx + 1) + '. ' : '') +
+        (a.ProductName || a.ProductShortName || vbb) +
+        (prijs != null ? ' · €' + prijs.toFixed(2) : '') +
+        (a.HasAvailability ? ' · vrij' : ' · vol');
+      label.addEventListener('click', () => {
+        const i = state.selectedAway.indexOf(vbb);
+        if (i >= 0) state.selectedAway.splice(i, 1); else state.selectedAway.push(vbb);
+        renderAwaySections(list);
+      });
+      row.appendChild(label);
       ui.sections.appendChild(row);
     });
   }
@@ -1342,6 +1539,19 @@
       // You do not have to choose what kind of event this is; the sections say.
       state.lastSections = all.length;
       if (all.length === 0) {
+        // An away fixture has no venue sections, but the sale flow's cross-sell
+        // step lists the real ones (coaches, car combi). Show them right away
+        // instead of making you press Start first.
+        const away = await loadAwaySections(eventId);
+        if (away.length) {
+          state.awaySections = away;
+          if (!preserve) state.selectedAway = [];
+          else state.selectedAway = state.selectedAway.filter(v => away.some(a => a.VenueBuildingBlockId === v));
+          renderAwaySections(away);
+          const vrij = away.filter(a => a.HasAvailability).length;
+          log('🚌 ' + away.length + ' sectie(s), ' + vrij + ' vrij. Klik ze aan op prioriteit (of laat leeg = eerste vrije).');
+          return;
+        }
         log('⏳ Nog geen vakken voor dit event — start gerust, de monitor pakt ze ' +
             'zodra ze verschijnen.');
       } else {
@@ -1437,6 +1647,79 @@
     } catch (e) { /* sound is optional */ }
   }
 
+  // The panel sits over the shop, so let it be moved and remember where. Drag
+  // by the header; double-click the header to snap back to the default corner.
+  // Position lives in localStorage so it survives a page load, unlike the
+  // per-tab session state.
+  const POS_KEY = 'ntsPanelPos';
+
+  function applyPanelPos(pos) {
+    const p = ui.panel;
+    if (!pos) {
+      p.style.left = p.style.top = '';
+      p.style.right = '16px';
+      p.style.bottom = '16px';
+      return;
+    }
+    // Keep at least a corner on screen after a resize or a smaller window.
+    const w = p.offsetWidth || 440, h = p.offsetHeight || 200;
+    const left = Math.min(Math.max(0, pos.left), Math.max(0, window.innerWidth - Math.min(w, 120)));
+    const top = Math.min(Math.max(0, pos.top), Math.max(0, window.innerHeight - 40));
+    p.style.right = p.style.bottom = 'auto';
+    p.style.left = left + 'px';
+    p.style.top = top + 'px';
+    void h;
+  }
+
+  function savePanelPos(pos) {
+    try {
+      if (pos) window.localStorage.setItem(POS_KEY, JSON.stringify(pos));
+      else window.localStorage.removeItem(POS_KEY);
+    } catch (e) { /* private mode: position simply is not remembered */ }
+  }
+
+  function readPanelPos() {
+    try {
+      const raw = window.localStorage.getItem(POS_KEY);
+      const p = raw && JSON.parse(raw);
+      return (p && Number.isFinite(p.left) && Number.isFinite(p.top)) ? p : null;
+    } catch (e) { return null; }
+  }
+
+  function makeDraggable(head) {
+    let start = null;
+    head.addEventListener('mousedown', (e) => {
+      if (e.button !== 0 || e.target.closest('button')) return;   // buttons keep working
+      const r = ui.panel.getBoundingClientRect();
+      start = { x: e.clientX, y: e.clientY, left: r.left, top: r.top, moved: false };
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!start) return;
+      const dx = e.clientX - start.x, dy = e.clientY - start.y;
+      if (!start.moved && Math.abs(dx) + Math.abs(dy) < 3) return;  // ignore a shaky click
+      start.moved = true;
+      ui.panel.classList.add('nts-dragging');
+      applyPanelPos({ left: start.left + dx, top: start.top + dy });
+    });
+    window.addEventListener('mouseup', () => {
+      if (!start) return;
+      ui.panel.classList.remove('nts-dragging');
+      if (start.moved) {
+        const r = ui.panel.getBoundingClientRect();
+        savePanelPos({ left: r.left, top: r.top });
+      }
+      start = null;
+    });
+    head.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button')) return;
+      savePanelPos(null);
+      applyPanelPos(null);
+      log('↩️ Paneel terug naar de rechteronderhoek.');
+    });
+    window.addEventListener('resize', () => applyPanelPos(readPanelPos()));
+  }
+
   function buildPanel() {
     const panel = document.createElement('div');
     panel.id = 'nts-panel';
@@ -1450,7 +1733,9 @@
       '    <select class="nts-event"><option value="">— kies event —</option></select></div>' +
       '  <div class="nts-label">Vakken (klik = prioriteit, 🪑 = kies stoelen): <button class="nts-refresh" title="ververs vakken">↻</button></div>' +
       '  <div class="nts-sections"></div>' +
-      '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label></div>' +
+      '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label>' +
+      '    <label title="find-my-seat is niet server-side afgeschermd: reserveren lukt vaak al eerder, afrekenen niet">' +
+      '      <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment</label></div>' +
       '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>' +
       '  <div class="nts-watchcard"></div>' +
       '  <div class="nts-counter">Vrij nu: —</div>' +
@@ -1464,6 +1749,7 @@
     ui.event = panel.querySelector('.nts-event');
     ui.sections = panel.querySelector('.nts-sections');
     ui.count = panel.querySelector('.nts-count');
+    ui.early = panel.querySelector('.nts-early');
     ui.startBtn = panel.querySelector('.nts-start');
     ui.stopBtn = panel.querySelector('.nts-stop');
     ui.reloadBtn = panel.querySelector('.nts-reload');
@@ -1488,6 +1774,7 @@
         state.cart.placed = []; state.cart.acquired = 0;
         persistCart();
       }
+      if (changed) { state.awaySections = []; state.prevAway = null; state.selectedAway = []; }
       if (state.eventId != null) loadSections(state.eventId, false);
       else clearEventCard();
     });
@@ -1496,6 +1783,13 @@
       state.wantedCount = n >= 1 ? n : 1;
       ui.count.value = String(state.wantedCount);
     });
+    ui.early.addEventListener('change', () => {
+      state.tryEarly = ui.early.checked;
+      state.earlyLogged = false;
+      log(state.tryEarly
+        ? '⏱ Aan: hij probeert ook vóór je koopmoment te reserveren.'
+        : '⏱ Uit: hij wacht tot de verkoop voor jou opengaat.');
+    });
     ui.startBtn.addEventListener('click', start);
     ui.stopBtn.addEventListener('click', stop);
     ui.reloadBtn.addEventListener('click', reloadCart);
@@ -1503,6 +1797,11 @@
       panel.classList.toggle('nts-min');
       e.target.textContent = panel.classList.contains('nts-min') ? '+' : '–';
     });
+
+    const head = panel.querySelector('.nts-head');
+    head.title = 'Sleep om te verplaatsen · dubbelklik voor de standaardplek';
+    makeDraggable(head);
+    applyPanelPos(readPanelPos());
 
     refreshTokenStatus();
     setInterval(refreshTokenStatus, 3000);

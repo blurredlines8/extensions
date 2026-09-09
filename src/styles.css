@@ -99,7 +99,16 @@
   padding: 11px 14px;
   background: var(--nts-surface);
   border-bottom: 1px solid var(--nts-border);
+  /* The header is the drag handle. */
+  cursor: grab;
+  user-select: none;
 }
+#nts-panel.nts-dragging .nts-head { cursor: grabbing; }
+/* No transitions or pointer events on the shop while dragging. */
+#nts-panel.nts-dragging { user-select: none; }
+/* Collapsed it is just the header bar — park it in a corner and read on. */
+#nts-panel.nts-min { width: auto; min-width: 220px; }
+#nts-panel.nts-min .nts-head { border-bottom: none; }
 #nts-panel .nts-head > span:first-child {
   flex: 1;
   display: flex;
@@ -319,6 +328,11 @@
 #nts-panel .nts-wc-flag {
   font-size: 10.5px; padding: 2px 7px; border-radius: 999px;
   border: 1px solid var(--nts-border-2); color: var(--nts-muted);
+}
+#nts-panel .nts-wc-pl {
+  font-size: 11px;
+  color: var(--nts-muted);
+  font-variant-numeric: tabular-nums;
 }
 #nts-panel .nts-wc-foot { font-size: 10.5px; color: var(--nts-faint); }
 
