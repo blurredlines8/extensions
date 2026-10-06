@@ -535,6 +535,74 @@
     } catch (e) { /* ignore a corrupt context */ }
   }
 
+  // Delete the ticket lines of an order, then clear the order itself, and
+  // forget it locally. ProductType 2/3 are the delivery/payment lines and the
+  // shop keeps those, so they are skipped. Shared by Herlaad and Leegmaken.
+  async function emptyOrder(orderId, orderUID) {
+    const details = await getOrderDetails(orderId, orderUID);
+    const lines = (details && (details.OrderLines
+      || (details.PendingOrderDetails && details.PendingOrderDetails.OrderLines))) || [];
+    const seatLines = lines.filter(l => l.ProductType !== 2 && l.ProductType !== 3 && l.Id != null);
+    let gone = 0;
+    for (const l of seatLines) {
+      try {
+        const res = await fetch(API + '/v2/PendingOrderLine/' + encodeURIComponent(l.Id) +
+          '/' + encodeURIComponent(orderId) + '/' + encodeURIComponent(orderUID), {
+          method: 'DELETE', credentials: 'omit', headers: headers(),
+        });
+        if (res.ok) gone++; else log('  delete-line HTTP ' + res.status);
+      } catch (e) { log('  delete-line error: ' + e.message); }
+    }
+    try {
+      await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(orderId) + '/clear/' + encodeURIComponent(orderUID), {
+        method: 'GET', credentials: 'omit', headers: headers(),
+      });
+    } catch (e) { log('  clear error: ' + e.message); }
+
+    // Fresh start: the next placement creates a new order.
+    state.cart.orderId = null; state.cart.orderUID = null;
+    state.cart.reservationId = null; state.cart.reservationUID = null;
+    state.cart.placed = [];
+    persistCart();
+    try { window.sessionStorage.removeItem('shoppingCartData'); } catch (e) { /* ok */ }
+    return { removed: gone, total: seatLines.length };
+  }
+
+  // Empty the cart and leave it empty. Works on whatever order the shop has
+  // open, so it also clears tickets this extension did not put there. Asks
+  // first: the tickets are released and someone else can take them.
+  async function clearCart() {
+    if (state.reloading) return;
+    let orderId = state.cart.orderId, orderUID = state.cart.orderUID;
+    if (!orderId) {
+      try {
+        const raw = window.sessionStorage.getItem('shoppingCartData');
+        const o = raw && JSON.parse(raw);
+        if (o) { orderId = o.PendingOrderId; orderUID = o.PendingOrderUID; }
+      } catch (e) { /* no cart is fine */ }
+    }
+    if (!orderId) { log('Er staat niets in de winkelwagen.'); return; }
+    if (!window.confirm('Alle kaarten uit de winkelwagen halen?\n\n' +
+        'Ze worden vrijgegeven en kunnen door iemand anders worden gepakt. ' +
+        'Dit kan niet ongedaan worden gemaakt.')) return;
+
+    ui.clearBtn.disabled = true;
+    try {
+      log('🗑 Winkelwagen leegmaken\u2026');
+      const r = await emptyOrder(orderId, orderUID);
+      state.cart.acquired = 0;
+      state.cart.attempted = new Set();
+      state.cart.done = false;
+      state.prevKeys = null;
+      log('🗑 ' + r.removed + '/' + r.total + ' regel(s) verwijderd; winkelwagen is leeg.');
+      ui.counter.textContent = 'Vrij nu: —';
+    } catch (e) {
+      log('Leegmaken mislukt: ' + e.message);
+    } finally {
+      ui.clearBtn.disabled = false;
+    }
+  }
+
   // Reload: throw the carted seats out of the shopping cart and put them back
   // again — a clean slate for when a seat appears to be "stuck". Does exactly
   // what the shop does (DELETE the lines, clear the order) and rebuilds after.
@@ -548,35 +616,7 @@
     try {
       log('🔄 Winkelwagen herladen (' + placed.length + ' stoel(en))…');
 
-      // 1. Remove the seat lines (ProductType 2/3 = delivery/payment line, we
-      //    leave those). Every line has an .Id = the line id for the DELETE.
-      const details = await getOrderDetails(orderId, orderUID);
-      const lines = (details && (details.OrderLines
-        || (details.PendingOrderDetails && details.PendingOrderDetails.OrderLines))) || [];
-      const seatLines = lines.filter(l => l.ProductType !== 2 && l.ProductType !== 3 && l.Id != null);
-      for (const l of seatLines) {
-        try {
-          const res = await fetch(API + '/v2/PendingOrderLine/' + encodeURIComponent(l.Id) +
-            '/' + encodeURIComponent(orderId) + '/' + encodeURIComponent(orderUID), {
-            method: 'DELETE', credentials: 'omit', headers: headers(),
-          });
-          if (!res.ok) log('  delete-line HTTP ' + res.status);
-        } catch (e) { log('  delete-line error: ' + e.message); }
-      }
-
-      // 2. Clear the (now empty) order.
-      try {
-        await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(orderId) + '/clear/' + encodeURIComponent(orderUID), {
-          method: 'GET', credentials: 'omit', headers: headers(),
-        });
-      } catch (e) { log('  clear error: ' + e.message); }
-
-      // Fresh start: the next placement creates a new order.
-      state.cart.orderId = null; state.cart.orderUID = null;
-      state.cart.reservationId = null; state.cart.reservationUID = null;
-      state.cart.placed = [];
-      persistCart();
-      try { window.sessionStorage.removeItem('shoppingCartData'); } catch (e) { /* ok */ }
+      await emptyOrder(orderId, orderUID);
 
       // 3. Put the same seats back into the shopping cart.
       let back = 0;
@@ -1817,7 +1857,7 @@
       '      <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment</label>' +
       '    <label title="Ververst de pagina als de wachtrij-token meer dan een minuut verlopen is, zodat de shop hem weer oppakt. Maximaal 3 keer. Houdt je plek NIET warm bij inactiviteit.">' +
       '      <input type="checkbox" class="nts-requeue"> &#128260; herstel wachtrij</label></div>' +
-      '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>' +
+      '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button><button class="nts-clear" title="Haalt alle kaarten uit de winkelwagen en laat hem leeg. De kaarten worden vrijgegeven.">🗑 Leeg</button></div>' +
       '  <div class="nts-watchcard"></div>' +
       '  <div class="nts-counter">Vrij nu: —</div>' +
       '  <div class="nts-log"></div>' +
@@ -1835,6 +1875,7 @@
     ui.startBtn = panel.querySelector('.nts-start');
     ui.stopBtn = panel.querySelector('.nts-stop');
     ui.reloadBtn = panel.querySelector('.nts-reload');
+    ui.clearBtn = panel.querySelector('.nts-clear');
     ui.counter = panel.querySelector('.nts-counter');
     ui.watchCard = panel.querySelector('.nts-watchcard');
     ui.refresh = panel.querySelector('.nts-refresh');
@@ -1882,6 +1923,7 @@
     ui.startBtn.addEventListener('click', start);
     ui.stopBtn.addEventListener('click', stop);
     ui.reloadBtn.addEventListener('click', reloadCart);
+    ui.clearBtn.addEventListener('click', clearCart);
     panel.querySelector('.nts-collapse').addEventListener('click', (e) => {
       panel.classList.toggle('nts-min');
       e.target.textContent = panel.classList.contains('nts-min') ? '+' : '–';

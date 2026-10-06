@@ -214,6 +214,9 @@
 }
 #nts-panel .nts-stop:hover:not(:disabled) { background: #d24a4a; }
 #nts-panel .nts-reload { margin-left: auto; }
+/* Destructive: releases the tickets, so set it apart from Herlaad. */
+#nts-panel .nts-clear { color: var(--nts-red-text); border-color: var(--nts-red); }
+#nts-panel .nts-clear:hover:not(:disabled) { background: var(--nts-red-bg); }
 
 /* Icon / ghost buttons */
 #nts-panel .nts-refresh,
