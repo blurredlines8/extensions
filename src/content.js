@@ -29,6 +29,7 @@
     evFetched: 0,
     right: null,               // this customer's purchase right for the event (or null)
     session: { wasCustomer: false, lastRefresh: 0 },
+    queue: { prev: null, staleWarned: false, autoReload: false, reloads: 0 },
     categoryRelaxedLogged: false,
     priceGroupsLogged: false,
     flowSteps: {},             // eventId -> SaleFlow steps (never change)
@@ -198,6 +199,82 @@
     } catch (e) {
       log('  select-position error: ' + e.message);
       return 'error';
+    }
+  }
+
+  // ---------------------------------------------------------------- queue ---
+  // The waiting room is ShopGuard and it keeps everything in localStorage. The
+  // page refreshes the token itself every 45s (shopGuardActivityPingInterval);
+  // if that loop dies — a network blip, a suspended tab — the token goes stale
+  // and the place is lost silently. We only watch and report. Refreshing the
+  // token ourselves would defeat the idle timeout that frees up places, and
+  // AGENTS.md rules that out.
+  function readQueue() {
+    try {
+      const ls = window.localStorage;
+      const token = ls.getItem('q_token');
+      if (!token) return null;
+      const exp = parseInt(ls.getItem('q_token_expires'), 10);
+      return {
+        status: ls.getItem('q_token_status'),
+        expires: Number.isFinite(exp) ? exp : null,
+        requeue: ls.getItem('q_token_expected-queue-full') === '1',
+        stale: Number.isFinite(exp) ? (Date.now() / 1000 > exp) : true,
+      };
+    } catch (e) { return null; }
+  }
+
+  const QUEUE_WORD = {
+    QUEUED: 'in de wachtrij',
+    WAITING_FOR_OUTFLOW: 'wordt doorgelaten',
+  };
+  const queueWord = q => (q ? (QUEUE_WORD[q.status] || 'binnen (' + showVal(q.status) + ')') : 'geen wachtrij');
+
+  // How long the token has been stale. The page normally refreshes well before
+  // expiry, so anything beyond a minute means its loop has stopped.
+  const staleFor = q => (q && q.expires ? Math.floor(Date.now() / 1000 - q.expires) : null);
+
+  function reportQueueChanges() {
+    const q = readQueue();
+    const prev = state.queue.prev;
+    state.queue.prev = q;
+
+    if (!prev && q) { log('🚦 Wachtrij: ' + queueWord(q) + (q.requeue ? ' · opnieuw aansluiten bij vertrek' : '')); return; }
+    if (prev && !q) {
+      log('🚨 Je wachtrij-token is weg — je staat niet meer in de rij.');
+      beep(); flashTitle('🚨 UIT DE RIJ');
+      return;
+    }
+    if (!q) return;
+
+    if (prev.status !== q.status) {
+      log('🚦 Wachtrij: ' + queueWord(prev) + ' → ' + queueWord(q));
+      if (q.status === 'QUEUED' && prev.status !== 'QUEUED') {
+        log('🚨 Teruggezet in de wachtrij.');
+        beep(); flashTitle('🚨 WACHTRIJ');
+      }
+      if (prev.status === 'QUEUED' && q.status !== 'QUEUED') {
+        log('🎉 Je bent door de wachtrij.');
+        beep(); flashTitle('🎉 DOOR DE RIJ');
+      }
+    }
+
+    // The page's own refresh has clearly stopped.
+    const over = staleFor(q);
+    if (over !== null && over > 60) {
+      if (!state.queue.staleWarned) {
+        state.queue.staleWarned = true;
+        log('⚠️ Wachtrij-token is ' + fmtDuration(over * 1000) + ' verlopen — de shop ververst niet meer. ' +
+            'Ververs de pagina om je plaats te herstellen.');
+        beep(); flashTitle('⚠️ WACHTRIJ VAST');
+        if (state.queue.autoReload && state.queue.reloads < 3) {
+          state.queue.reloads++;
+          log('🔄 Pagina verversen (' + state.queue.reloads + '/3) — de shop pakt je token weer op.');
+          setTimeout(() => window.location.reload(), 1500);
+        }
+      }
+    } else {
+      state.queue.staleWarned = false;
     }
   }
 
@@ -1577,7 +1654,9 @@
     const customer = c.type === 'Customer';
     const left = c.exp ? c.exp * 1000 - Date.now() : null;
     const leftTxt = left == null ? '' : ' · ' + (left > 0 ? fmtDuration(left) + ' geldig' : 'VERLOPEN');
-    ui.token.textContent = (customer ? 'ingelogd' : 'anoniem') + leftTxt;
+    const q = readQueue();
+    const qTxt = q ? ' · ' + (q.stale ? '⚠️ rij verlopen' : '🚦 ' + queueWord(q)) : '';
+    ui.token.textContent = (customer ? 'ingelogd' : 'anoniem') + leftTxt + qTxt;
     ui.token.className = 'nts-token' + (customer && left > 0 ? ' nts-ok' : ' nts-bad');
 
     if (state.session.wasCustomer && !customer) {
@@ -1735,7 +1814,9 @@
       '  <div class="nts-sections"></div>' +
       '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label>' +
       '    <label title="find-my-seat is niet server-side afgeschermd: reserveren lukt vaak al eerder, afrekenen niet">' +
-      '      <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment</label></div>' +
+      '      <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment</label>' +
+      '    <label title="Ververst de pagina als de wachtrij-token meer dan een minuut verlopen is, zodat de shop hem weer oppakt. Maximaal 3 keer. Houdt je plek NIET warm bij inactiviteit.">' +
+      '      <input type="checkbox" class="nts-requeue"> &#128260; herstel wachtrij</label></div>' +
       '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>' +
       '  <div class="nts-watchcard"></div>' +
       '  <div class="nts-counter">Vrij nu: —</div>' +
@@ -1750,6 +1831,7 @@
     ui.sections = panel.querySelector('.nts-sections');
     ui.count = panel.querySelector('.nts-count');
     ui.early = panel.querySelector('.nts-early');
+    ui.requeue = panel.querySelector('.nts-requeue');
     ui.startBtn = panel.querySelector('.nts-start');
     ui.stopBtn = panel.querySelector('.nts-stop');
     ui.reloadBtn = panel.querySelector('.nts-reload');
@@ -1790,6 +1872,13 @@
         ? '⏱ Aan: hij probeert ook vóór je koopmoment te reserveren.'
         : '⏱ Uit: hij wacht tot de verkoop voor jou opengaat.');
     });
+    ui.requeue.addEventListener('change', () => {
+      state.queue.autoReload = ui.requeue.checked;
+      state.queue.reloads = 0;
+      log(state.queue.autoReload
+        ? '🔄 Aan: bij een vastgelopen wachtrij ververst hij de pagina (max 3×).'
+        : '🔄 Uit: hij meldt een vastgelopen wachtrij alleen.');
+    });
     ui.startBtn.addEventListener('click', start);
     ui.stopBtn.addEventListener('click', stop);
     ui.reloadBtn.addEventListener('click', reloadCart);
@@ -1805,6 +1894,10 @@
 
     refreshTokenStatus();
     setInterval(refreshTokenStatus, 3000);
+    // The queue lives in localStorage and changes outside our poll rounds, so
+    // watch it on its own short interval — also when the monitor is stopped.
+    reportQueueChanges();
+    setInterval(reportQueueChanges, 5000);
     // Session keep-alive: check every 10 minutes, act when it is time.
     keepSessionAlive();
     setInterval(keepSessionAlive, 10 * 60 * 1000);
