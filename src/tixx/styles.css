@@ -694,3 +694,18 @@
 /* Title on one line, as in the Tymes4 panel. */
 #sat-panel .sat-title { white-space: nowrap; }
 #sat-panel .sat-token { white-space: nowrap; }
+
+/* The extension was updated while this page ran the old code. */
+#sat-panel .sat-stale {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  color: var(--sat-text);
+  background: #3a2f10;
+  border: 1px solid #6b5518;
+  border-radius: var(--sat-r-sm);
+}
+#sat-panel .sat-stale button { margin-left: 6px; padding: 3px 10px; }
+@media (prefers-color-scheme: light) {
+  #sat-panel .sat-stale { background: #fdf3d8; border-color: #e8cf8a; }
+}

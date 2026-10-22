@@ -614,3 +614,18 @@
 #nts-panel .nts-token { white-space: nowrap; }
 /* In the cart bar the buttons sit together, as in the TIXX panel. */
 #nts-panel .nts-cartbar .nts-reload { margin-left: 0; }
+
+/* The extension was updated while this page ran the old code. */
+#nts-panel .nts-stale {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  color: var(--nts-text);
+  background: #3a2f10;
+  border: 1px solid #6b5518;
+  border-radius: var(--nts-r-sm);
+}
+#nts-panel .nts-stale button { margin-left: 6px; padding: 3px 10px; }
+@media (prefers-color-scheme: light) {
+  #nts-panel .nts-stale { background: #fdf3d8; border-color: #e8cf8a; }
+}

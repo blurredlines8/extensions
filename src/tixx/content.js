@@ -33,10 +33,14 @@
   // The venue page's block list (what is on sale, what sold out) moves faster
   // than its signature; while the plan is open, refresh it this often. A claim
   // reuses it when it is at most CLAIM_VENUE_MS old.
-  const AREAS_TTL_MS = 60 * 1000;
+  const AREAS_TTL_MS = 5 * 60 * 1000;   // 265 kB a time: not every minute for days
   const CLAIM_VENUE_MS = 20 * 1000;
   // ...and sooner when one of your blocks off that list shows free seats.
   const RECHECK_MS = 15 * 1000;
+  // A seat that failed may be tried again after this long: someone else's
+  // hold runs out after 20 minutes and then it is free again.
+  const RETRY_MS = 3 * 60 * 1000;
+  const LOG_MAX = 300;
   // Every club shares one origin, so keep choices per shop.
   const SETTINGS_KEY = 'satSettings:' + BASE;
   const RUNNING_KEY = 'satRunning:' + BASE;
@@ -74,7 +78,8 @@
     schedule: [],          // the club's presale table, if it publishes one
     fired: new Set(),      // sale moments already announced in this tab
     blocked: false,        // the shop asked for a human check: stop polling
-    armTime: '',           // "HH:MM" today: the sale start you expect
+    armTime: '',           // "HH:MM": the sale start you expect …
+    armDate: '',           // … on this day (YYYY-MM-DD); on another day it no longer counts
     armMatch: '',          // auto-select and start the match whose name contains this
     autoStarted: false,
     venue: null,           // parsed venue page (signature, stands, prices)
@@ -112,7 +117,7 @@
     timer: null,
     nextAt: 0,
     acquired: 0,
-    attempted: new Set(),  // seats we tried; never hammer the same one again
+    attempted: new Map(),  // seat -> when we tried it; not again within RETRY_MS
     waitLogged: false,
     gaLogged: new Set(),
     title: null,
@@ -243,13 +248,16 @@
     }
     const old = state.stadium;
     const oldStand = new Map(((old && old.blocks) || []).map(b => [b.name, b.stand]));
-    if (old && old.blocks.length) {
-      const known = new Set(old.blocks.map(b => b.name));
-      const shared = blocks.filter(b => known.has(b.name)).length;
-      state.foreignVenue = shared < Math.min(blocks.length, known.size) / 2;
-      if (state.foreignVenue) { log('🏟 Dit stoelplan hoort bij een ander stadion; je vakvoorkeur geldt hier niet.'); return; }
-    } else {
-      state.foreignVenue = false;
+    const names = new Set(blocks.map(b => b.name));
+    // Another stadium (an away match) is one where none of your blocks exist.
+    // Not "differs from what we stored": a wrong first stadium would then lock
+    // out every home match for good.
+    state.foreignVenue = state.prefs.length > 0 && !state.prefs.some(n => names.has(n));
+    if (state.foreignVenue) { log('🏟 Dit stoelplan hoort bij een ander stadion; je vakvoorkeur geldt hier niet.'); return; }
+    if (old && old.blocks.length && !state.prefs.length) {
+      // No preference to go by: keep what we know unless this plan is mostly the same.
+      const shared = blocks.filter(b => oldStand.has(b.name)).length;
+      if (shared < Math.min(blocks.length, old.blocks.length) / 2) return;
     }
     const next = blocks.map(b => ({
       name: b.name,
@@ -274,6 +282,19 @@
   function savePrefs() {
     storeSet(PREFS_KEY, state.prefs);
     applyPrefs();
+  }
+
+  // Forget the stadium and learn it again (from this match's plan if there
+  // is one, otherwise from any open one) — for when it was learned wrong.
+  async function relearnStadium() {
+    state.stadium = null;
+    state.foreignVenue = false;
+    await storeSet(STADIUM_KEY, null);
+    log('🏟 Stadion vergeten; ik leer het opnieuw.');
+    if (state.blocks.length) await learnStadium(state.blocks, state.venue);
+    else await learnFromOpenMatch();
+    applyPrefs();
+    renderBlocks();
   }
 
   // No stadium known yet: learn it from any match whose plan is open now
@@ -352,6 +373,18 @@
   }
 
   const MODE_TEXT = { row: 'in één rij', cluster: 'cluster', loose: 'los' };
+
+  function markTried(id) { state.attempted.set(id, Date.now()); }
+  // Seats tried within RETRY_MS; older ones are forgotten and may be tried again.
+  function tried() {
+    const now = Date.now();
+    const out = new Set();
+    for (const [id, at] of state.attempted) {
+      if (now - at < RETRY_MS) out.add(id);
+      else state.attempted.delete(id);
+    }
+    return out;
+  }
 
   // Blocks to search, in priority order, minus those this shop does not sell
   // (not in the venue page's areaList) and those where the shop would not
@@ -459,7 +492,7 @@
   async function groupPick(candidates) {
     const v = await groupSync();
     const need = state.want - state.acquired;
-    const opts = { mine: need, geo: state.geo, accept: accepts, skip: state.attempted };
+    const opts = { mine: need, geo: state.geo, accept: accepts, skip: tried() };
     if (!v) {
       groupOnce('nobg', '⚠️ Groep niet bereikbaar; ik kies alleen voor dit account.');
       return core.pickSeats(candidates, Object.assign({ want: need, mode: 'cluster', maxRows: 2, blocks: eligibleBlocks() }, opts));
@@ -509,7 +542,7 @@
     for (const id of ids) {
       const block = core.blockOf(id);
       const lab = (await getLabels(block)).get(id);
-      if (!lab) { log('✗ ' + id + ' staat niet in het blokplan'); state.attempted.add(id); continue; }
+      if (!lab) { log('✗ ' + id + ' staat niet in het blokplan'); markTried(id); continue; }
       const b = state.blocks.find(x => x.id === block);
       const body = new URLSearchParams();
       body.set('seats[0][priceId]', String(categoryOf(id) || ''));
@@ -528,7 +561,7 @@
       const card = res.ok ? core.parseSeatCard(text) : null;
       if (!card) {
         log('✗ ' + seatName(id) + ' niet te kiezen: ' + refusal(res.status, text));
-        state.attempted.add(id);
+        markTried(id);
         continue;
       }
       fields.push([card.field, card.chosen.value]);
@@ -540,7 +573,7 @@
     if (state.mode !== 'loose' && chosen.length < ids.length) {
       log('↩️ Niet de hele groep gelukt, selectie losgelaten.');
       await clearSelection();
-      ids.forEach(id => state.attempted.add(id));
+      ids.forEach(markTried);
       return 0;
     }
 
@@ -553,7 +586,7 @@
     if (!items.length) items = core.parseCart(await (await shopFetch('/shoppingcart')).text());
     const landed = chosen.filter(id => items.some(it => it.seatId === id));
     if (items.length) state.cart = items.filter(it => Number(it.eventId) === ev).map(it => it.seatId);
-    ids.forEach(id => state.attempted.add(id));
+    ids.forEach(markTried);
     if (landed.length) {
       state.cartSeats = state.cartSeats.concat(landed.map(seatName));
       log('🛒 In winkelwagen: ' + landed.map(seatName).join(', '));
@@ -706,7 +739,7 @@
         await fetchMapping();
         const ids = state.group ? await groupPick(candidates) : core.pickSeats(candidates, {
           want: state.want - state.acquired, mode: state.mode, geo: state.geo,
-          blocks: eligibleBlocks(), skip: state.attempted, accept: accepts,
+          blocks: eligibleBlocks(), skip: tried(), accept: accepts,
         });
         setCounter(candidates.filter(accepts).length);
         if (ids.length) {
@@ -814,7 +847,7 @@
     if (state.eventId == null) { log('Kies eerst een wedstrijd.'); return; }
     state.running = true;
     state.acquired = 0;
-    state.attempted = new Set();
+    state.attempted = new Map();
     state.cart = null;     // checked on the first round: what is held counts against the limit
     state.waitLogged = false;
     state.cartSeats = [];
@@ -922,7 +955,7 @@
     try {
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({
         eventId: state.eventId, eventLabel: state.eventLabel, eventDate: state.eventDate,
-        want: state.want, mode: state.mode, kind: state.kind, armTime: state.armTime, armMatch: state.armMatch,
+        want: state.want, mode: state.mode, kind: state.kind, armTime: state.armTime, armDate: state.armDate, armMatch: state.armMatch,
         group: state.group,
       }));
     } catch (e) { /* private mode: settings are simply not remembered */ }
@@ -961,6 +994,7 @@
     const line = document.createElement('div');
     line.textContent = nowStr().slice(0, 5) + '  ' + msg;
     ui.log.appendChild(line);
+    while (ui.log.childElementCount > LOG_MAX) ui.log.removeChild(ui.log.firstChild);
     ui.log.scrollTop = ui.log.scrollHeight;
     ui.lastLog.textContent = msg;
   }
@@ -1124,7 +1158,10 @@
     else if (state.loggedIn === false) add('bad', 'Niet ingelogd: zonder login zie je de ledenverkoop niet', { label: 'Inloggen', on: () => { window.location.href = loginUrl(); } });
     else add('info', 'Inlogstatus nog onbekend');
 
-    add(state.eventId != null ? 'ok' : 'bad', state.eventId != null ? matchTitle() : 'Nog geen wedstrijd gekozen');
+    const listed = !state.events.length || state.events.some(e => e.id === state.eventId);
+    if (state.eventId == null) add('bad', 'Nog geen wedstrijd gekozen');
+    else if (!listed && state.loggedIn === true) add('bad', 'Deze wedstrijd staat niet meer in de shop — kies een andere');
+    else add('ok', matchTitle());
 
     if (state.foreignVenue) {
       add('info', 'Ander stadion (uitwedstrijd): je vakvoorkeur geldt hier niet, alle vakken tellen');
@@ -1315,9 +1352,11 @@
     try { window.localStorage.setItem(KNOWN_KEY, JSON.stringify(next)); } catch (e) { /* not remembered */ }
   }
 
+  const todayKey = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+
   function armAt() {
     const m = /^(\d{1,2}):(\d{2})$/.exec(state.armTime || '');
-    if (!m) return null;
+    if (!m || state.armDate !== todayKey()) return null;
     const d = new Date();
     d.setHours(Number(m[1]), Number(m[2]), 0, 0);
     return d.getTime();
@@ -1343,7 +1382,10 @@
     const e = list.find(x => x.open && x.label.toLowerCase().includes(want));
     if (!e) return;
     state.autoStarted = true;
-    log('🚀 ' + e.label + ' heeft tickets: automatisch gekozen en gestart.');
+    log('🚀 ' + e.label + ' heeft tickets: automatisch gekozen en gestart. Auto-start staat nu weer uit (eenmalig).');
+    // Once: a name left in here would otherwise start a later match too.
+    state.armMatch = '';
+    ui.armMatch.value = '';
     if (state.eventId !== e.id) {
       ui.event.value = String(e.id);
       onEventChange();
@@ -1783,6 +1825,7 @@
       '      <label>Soort <select class="sat-kind" title="Welke plaatsen tellen mee">' +
       '        <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +
       '      </select></label></div>' +
+      '      <div class="sat-row"><button class="sat-relearn" title="Vergeet het opgeslagen stadion en leer het opnieuw — als de vakken niet kloppen">🏟 Stadion opnieuw leren</button></div>' +
       '      <div class="sat-row"><button class="sat-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
       '      <div class="sat-row"><input type="text" class="sat-armmatch" placeholder="Auto-start: wedstrijd waarvan de naam … bevat" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
       '      <div class="sat-row"><button class="sat-reload-more" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad winkelwagen</button>' +
@@ -1842,6 +1885,7 @@
     ui.kind.addEventListener('change', () => { state.kind = ui.kind.value; saveSettings(); groupSync(); });
     ui.armTime.addEventListener('change', () => {
       state.armTime = ui.armTime.value;
+      state.armDate = state.armTime ? todayKey() : '';
       saveSettings();
       log(state.armTime ? '⏱ Verkoopstart ' + state.armTime + ': van 2 min ervoor tot 15 min erna kijkt hij elke 5 s.' : '⏱ Geen verkoopstart ingesteld.');
       warnLogin();
@@ -1863,6 +1907,7 @@
     panel.querySelector('.sat-reload-cart').addEventListener('click', reloadCart);
     panel.querySelector('.sat-reload-more').addEventListener('click', reloadCart);
     panel.querySelector('.sat-notify-btn').addEventListener('click', openOptions);
+    panel.querySelector('.sat-relearn').addEventListener('click', relearnStadium);
     panel.querySelector('.sat-collapse').addEventListener('click', (e) => {
       panel.classList.toggle('sat-min');
       e.target.textContent = panel.classList.contains('sat-min') ? '+' : '–';
@@ -1890,7 +1935,9 @@
       state.want = s.want >= 1 ? s.want : 1;
       state.mode = MODE_TEXT[s.mode] ? s.mode : (s.together === false ? 'loose' : 'row');
       state.kind = ['all', 'sale', 'resale'].includes(s.kind) ? s.kind : 'all';
-      state.armTime = typeof s.armTime === 'string' ? s.armTime : '';
+      // A sale start from another day no longer means anything.
+      state.armDate = typeof s.armDate === 'string' ? s.armDate : '';
+      state.armTime = typeof s.armTime === 'string' && state.armDate === todayKey() ? s.armTime : '';
       state.armMatch = typeof s.armMatch === 'string' ? s.armMatch : '';
       state.group = s.group === true;
     }
@@ -1933,6 +1980,21 @@
 
     // The stadium and your blocks live in extension storage (shared by all
     // containers); wait for them before resuming or registering the group.
+    // After an automatic update of the extension this page still runs the old
+    // code, cut off from the extension: storage, notifications and the group
+    // no longer work. Say so; a refresh loads the new version (and resumes).
+    const alive = () => { try { return !!(ext && ext.runtime && ext.runtime.id); } catch (e) { return false; } };
+    const staleCheck = setInterval(() => {
+      if (alive()) return;
+      clearInterval(staleCheck);
+      const n = el('div', 'sat-stale', 'Seat Assist is bijgewerkt. Ververs dit tabblad om de nieuwe versie te gebruiken (een lopende zoekactie gaat daarna verder). ');
+      const b = el('button', null, 'Verversen');
+      b.addEventListener('click', () => window.location.reload());
+      n.appendChild(b);
+      panel.querySelector('.sat-body').prepend(n);
+      log('⚠️ De extensie is bijgewerkt; ververs dit tabblad.');
+    }, 30000);
+
     storeGet(NOTIFY_KEY).then(url => {
       state.notifyOn = !!url;
       render();

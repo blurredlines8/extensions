@@ -82,6 +82,7 @@
       return groupView(club, me);
     }
     const m = g.members[me] || (g.members[me] = { n: g.next++, cart: [], claim: null });
+    m.tabId = sender.tab.id;
     if (msg.op === 'update') {
       m.eventId = msg.eventId;
       m.want = Math.max(1, Number(msg.want) || 1);
@@ -108,6 +109,17 @@
       return groupView(club, me);
     }
     return groupView(club, me);
+  }
+
+  // A closed tab leaves its group; otherwise it would keep counting towards
+  // the total the first account looks for room for.
+  if (ext.tabs && ext.tabs.onRemoved) {
+    ext.tabs.onRemoved.addListener(tabId => {
+      for (const [club, g] of Object.entries(groups)) {
+        for (const [key, m] of Object.entries(g.members)) if (m.tabId === tabId) delete g.members[key];
+        if (!Object.keys(g.members).length) delete groups[club];
+      }
+    });
   }
 
   ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {

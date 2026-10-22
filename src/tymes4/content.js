@@ -20,6 +20,14 @@
   // kinder to the shop. Anything free, or your sale moment near: full speed.
   const QUIET_AFTER_MS = 2 * 60 * 1000;
   const QUIET_INTERVAL_MS = 30000;
+  // A seat that failed may be tried again after this long: someone else's
+  // hold runs out after 20 minutes and then it is free again.
+  const RETRY_MS = 3 * 60 * 1000;
+  // A running search resumes after a page load in this tab (refresh, "herstel
+  // wachtrij"); the chosen match is remembered per shop.
+  const RUN_KEY = 'ntsRun';
+  const EVENT_KEY = 'ntsEvent';
+  const LOG_MAX = 300;
 
   const state = {
     events: [],
@@ -65,6 +73,8 @@
       orderId: null, orderUID: null,   // the PendingOrder = the visible shopping cart
       placed: [],          // {section, col} for each carted seat, for reload/re-add
       acquired: 0, attempted: new Set(), done: false,
+      seatTried: new Map(),   // home seats: key -> when it failed (retry after RETRY_MS)
+      channel: null,          // the sales channel this cart (order) belongs to
     },
   };
 
@@ -534,6 +544,7 @@
   function persistCart() {
     try {
       window.sessionStorage.setItem(CART_CTX_KEY, JSON.stringify({
+        cartChannel: state.cart.channel || null,
         eventId: state.eventId,
         eventCategory: state.eventCategory,
         orderId: state.cart.orderId,
@@ -558,6 +569,7 @@
       if (c.eventCategory != null) state.eventCategory = c.eventCategory;
       state.cart.orderId = c.orderId || null;
       state.cart.orderUID = c.orderUID || null;
+      state.cart.channel = c.cartChannel || null;
       state.cart.placed = Array.isArray(c.placed) ? c.placed : [];
       state.cart.acquired = state.cart.placed.length;
       if (state.cart.placed.length) {
@@ -659,6 +671,7 @@
       }
       state.cart.acquired = 0;
       state.cart.attempted = new Set();
+      state.cart.seatTried = new Map();
       state.cart.done = false;
       state.prevKeys = null;
       log('🗑 ' + r.removed + '/' + r.total + ' regel(s) verwijderd; winkelwagen is leeg.');
@@ -680,6 +693,7 @@
     // Seats from another sales channel are in that channel's cart: not here.
     const placed = (state.cart.placed || []).filter(p => !p.channel);
     if (!state.cart.orderId || !placed.length) { log('Niks in de winkelwagen om te herladen.'); return; }
+    if (state.cart.channel && state.cart.channel !== pageChannel()) { log('Herlaad werkt alleen in het verkoopkanaal waar die stoelen zitten.'); return; }
     if (state.reloading) return;
     state.reloading = true;
     ui.reloadBtn.disabled = true;
@@ -721,6 +735,27 @@
     }
   }
 
+  // Seats of one match in the carts we know (this page's and other channels').
+  async function seatsInCarts(eventId) {
+    const orders = [];
+    if (state.cart.orderId) orders.push([state.cart.orderId, state.cart.orderUID, null]);
+    await loadChannels();
+    for (const id of Object.keys(chan.orders).map(Number)) {
+      const o = chan.orders[id];
+      if (!o || !o.orderId) continue;
+      try { orders.push([o.orderId, o.orderUID, await channelToken(id)]); } catch (e) { /* skip that one */ }
+    }
+    let n = 0;
+    for (const [id, uid, tok] of orders) {
+      try {
+        const d = await getOrderDetails(id, uid, tok);
+        const lines = (d && (d.OrderLines || (d.PendingOrderDetails && d.PendingOrderDetails.OrderLines))) || [];
+        n += lines.filter(l => l.ProductType !== 2 && l.ProductType !== 3 && l.EventId === eventId).length;
+      } catch (e) { /* unknown: count none */ }
+    }
+    return n;
+  }
+
   // ------------------------------------------------------------ channels ---
   // NEC sells through more than one sales channel in the same shop: "Ticketshop
   // Regulier" (1) and "Ticketshop secundair" (7, the second-chance sale). The
@@ -732,7 +767,8 @@
   // its own channel until you check out there. Away matches: page channel only.
   const CHANNEL_KEY = 'ntsChannels';
   const ORDERS_KEY = 'ntsChannelOrders';
-  const chan = { list: null, tokens: new Map(), orders: {}, failed: new Set() };
+  const chan = { list: null, tokens: new Map(), orders: {}, failed: new Map() };   // failed: id -> when
+  const CHANNEL_RETRY_MS = 5 * 60 * 1000;
 
   const pageChannel = () => {
     const c = decodeJwt(getToken() || '');
@@ -787,12 +823,13 @@
     const page = pageChannel();
     let extra = 0;
     for (const c of list) {
-      if (c.Id === page || !channelInScope(c.Id) || chan.failed.has(c.Id) || state.cart.done) continue;
+      if (c.Id === page || !channelInScope(c.Id) || state.cart.done) continue;
+      if (chan.failed.has(c.Id) && Date.now() - chan.failed.get(c.Id) < CHANNEL_RETRY_MS) continue;
       const label = channelLabel(c);
       let tok;
-      try { tok = await channelToken(c.Id); } catch (e) {
-        chan.failed.add(c.Id);
-        log('⚠️ Kanaal ' + label + ' niet bereikbaar (' + e.message + '); ik kijk alleen in het kanaal van deze pagina.');
+      try { tok = await channelToken(c.Id); chan.failed.delete(c.Id); } catch (e) {
+        if (!chan.failed.has(c.Id)) log('⚠️ Kanaal ' + label + ' niet bereikbaar (' + e.message + '); ik probeer het over 5 min opnieuw.');
+        chan.failed.set(c.Id, Date.now());
         continue;
       }
       const order = chan.orders[c.Id] || (chan.orders[c.Id] = { reservationId: null, reservationUID: null, orderId: null, orderUID: null });
@@ -824,17 +861,21 @@
   // the shop shows once the page is in that channel — so switch the page there
   // exactly as the shop's own switch does (its token in the session), then open
   // the cart.
-  function checkout(channelId) {
-    if (channelId && channelId !== pageChannel()) {
-      const t = chan.tokens.get(channelId);
-      const o = chan.orders[channelId];
-      if (t && o && o.orderId) {
-        try {
-          window.sessionStorage.setItem('jwt', t.token);
-          window.sessionStorage.setItem('shoppingCartData', JSON.stringify({ PendingOrderId: o.orderId, PendingOrderUID: o.orderUID }));
-        } catch (e) { /* fall through to the cart page */ }
+  // The order of a channel: the cart this run started in, or another channel's.
+  const orderOf = id => (id === (state.cart.channel || pageChannel()) ? state.cart : chan.orders[id]);
+
+  async function checkout(channelId) {
+    const target = channelId || state.cart.channel || pageChannel();
+    const o = orderOf(target);
+    try {
+      if (target !== pageChannel()) {
+        const tok = await channelToken(target);
+        window.sessionStorage.setItem('jwt', tok);
       }
-    }
+      if (o && o.orderId) {
+        window.sessionStorage.setItem('shoppingCartData', JSON.stringify({ PendingOrderId: o.orderId, PendingOrderUID: o.orderUID }));
+      }
+    } catch (e) { log('⚠️ Kon niet naar dat verkoopkanaal wisselen (' + e.message + '); ik open de winkelwagen zoals hij is.'); }
     window.location.href = CART_URL;
   }
 
@@ -1207,11 +1248,12 @@
     for (const col of pool) {
       if (state.cart.done) break;
       const key = section.VenueBuildingBlockId + ':' + col.Id;
-      if (state.cart.attempted.has(key)) continue;
+      const triedAt = state.cart.seatTried.get(key);
+      if (triedAt && Date.now() - triedAt < RETRY_MS) continue;
 
       log('➡️ Poging' + (ch ? ' (' + ch.label + ')' : '') + ': ' + section.Name + ' — rij ' + col.RowNumber + ', stoel ' + col.SeatNumber);
       const result = await claimSeat(section, col, ch);
-      if (result === 'ok' || result === 'unavailable') state.cart.attempted.add(key);
+      if (result === 'ok' || result === 'unavailable') state.cart.seatTried.set(key, Date.now());
       if (result !== 'ok') continue;
 
       log('  · vastgehouden, in winkelwagen plaatsen…');
@@ -1705,9 +1747,14 @@
     if (state.watch.title !== null) { document.title = state.watch.title; state.watch.title = null; }
   }
 
-  function start() {
-    if (state.timer) return;
-    if (state.eventId == null) { log('Kies eerst een event.'); return; }
+  async function start() {
+    if (state.timer || state.starting) return;
+    if (state.eventId == null) { log('Kies eerst een wedstrijd.'); return; }
+    state.starting = true;
+    try { await startRun(); } finally { state.starting = false; }
+  }
+
+  async function startRun() {
     // Reuse an already-open shopping cart if the shop has one, so placed seats
     // join it instead of spawning a second order.
     let order = { PendingOrderId: null, PendingOrderUID: null };
@@ -1720,8 +1767,19 @@
       orderId: order.PendingOrderId || null, orderUID: order.PendingOrderUID || null,
       placed: [],
       acquired: 0, attempted: new Set(), done: false,
+      seatTried: new Map(), channel: pageChannel(),
     };
     persistCart();
+    // Seats of this match already in a cart count towards what you want, like
+    // the TIXX panel does — otherwise a restart would buy the full number again.
+    const held = await seatsInCarts(state.eventId);
+    if (held >= state.wantedCount) {
+      log('🛒 Je hebt al ' + held + ' kaart(en) voor deze wedstrijd in je winkelwagen; niets te zoeken.');
+      return;
+    }
+    state.cart.acquired = held;
+    if (held) log('🛒 Al ' + held + ' kaart(en) in je winkelwagen; ik zoek er nog ' + (state.wantedCount - held) + ' bij.');
+    try { window.sessionStorage.setItem(RUN_KEY, String(state.eventId)); } catch (e) { /* no resume then */ }
     state.prevKeys = null;
     state.totalAppeared = 0;
     state.lastPoll = 0;
@@ -1743,6 +1801,7 @@
 
   function stop() {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    try { window.sessionStorage.removeItem(RUN_KEY); } catch (e) { /* ignore */ }
     restoreTitle();
     setRunning(false);
   }
@@ -1753,6 +1812,9 @@
   async function syncCartTime() {
     let { orderId, orderUID } = state.cart;
     let tok = null;
+    if (orderId && state.cart.channel && state.cart.channel !== pageChannel()) {
+      try { tok = await channelToken(state.cart.channel); } catch (e) { return; }
+    }
     if (!orderId) {
       const id = Object.keys(chan.orders).map(Number).find(k => chan.orders[k] && chan.orders[k].orderId);
       if (id == null) return;
@@ -1877,7 +1939,9 @@
     if (q && q.stale) add('warn', 'Je wachtrij-token is verlopen: ververs de pagina (of zet "herstel wachtrij" aan)');
 
     const ev = state.events.find(e => e.eventId === state.eventId);
-    add(state.eventId != null ? 'ok' : 'bad', state.eventId != null ? (ev ? ev.name : 'Event ' + state.eventId) : 'Nog geen wedstrijd gekozen');
+    if (state.eventId == null) add('bad', 'Nog geen wedstrijd gekozen');
+    else if (!ev && state.events.length && sess.customer === true) add('bad', 'Deze wedstrijd staat niet meer in de shop — kies een andere');
+    else add('ok', ev ? ev.name : 'Event ' + state.eventId);
 
     if (state.eventId != null) {
       if (!state.sections.length && state.awaySections.length) {
@@ -1977,13 +2041,14 @@
         : p.spots + '× ' + p.section.Name) + (p.channelLabel ? ' · ' + p.channelLabel : ''));
     }
     // One check-out button per cart: seats can sit in two channels' carts.
-    const carts = [...new Set(state.cart.placed.map(p => p.channel || 0))];
-    const name = id => (id ? (state.cart.placed.find(p => p.channel === id) || {}).channelLabel : 'regulier');
+    const own = state.cart.channel || pageChannel();
+    const carts = [...new Set(state.cart.placed.map(p => p.channel || own))];
+    const name = id => channelLabel((chan.list || []).find(c => c.Id === id));
     ui.pay.textContent = 'Afrekenen' + (carts.length > 1 ? ' ' + name(carts[0]) : '') + ' →';
-    ui.pay.dataset.channel = String(carts[0] || 0);
+    ui.pay.dataset.channel = String(carts[0] || own);
     ui.pay2.style.display = carts.length > 1 ? '' : 'none';
     // Herlaad only works on the page channel's cart.
-    ui.reloadCart.style.display = carts.includes(0) ? '' : 'none';
+    ui.reloadCart.style.display = carts.includes(own) && own === pageChannel() ? '' : 'none';
     if (carts.length > 1) {
       ui.pay2.textContent = 'Afrekenen ' + name(carts[1]) + ' →';
       ui.pay2.dataset.channel = String(carts[1]);
@@ -2010,6 +2075,7 @@
     const line = document.createElement('div');
     line.textContent = nowStr().slice(0, 5) + '  ' + msg;
     ui.log.appendChild(line);
+    while (ui.log.childElementCount > LOG_MAX) ui.log.removeChild(ui.log.firstChild);
     ui.log.scrollTop = ui.log.scrollHeight;
     if (ui.lastLog) ui.lastLog.textContent = msg;
   }
@@ -2244,6 +2310,25 @@
 
     updateCount();
     ui.picker.style.display = 'flex';
+  }
+
+  async function restoreSelection() {
+    let saved = state.eventId;
+    try { if (saved == null) saved = Number(window.localStorage.getItem(EVENT_KEY)) || null; } catch (e) { /* none */ }
+    let run = null;
+    try { run = Number(window.sessionStorage.getItem(RUN_KEY)) || null; } catch (e) { /* none */ }
+    if (run) saved = run;
+    const ev = saved != null && state.events.find(e => e.eventId === saved);
+    if (!ev) { render(); return; }
+    state.eventId = ev.eventId;
+    state.eventCategory = ev.saleCategoryId;
+    ui.event.value = String(ev.eventId);
+    await loadSections(ev.eventId, true);
+    render();
+    if (run === ev.eventId && !state.cart.done && !state.timer) {
+      log('↻ Hervat na het laden van de pagina.');
+      start();
+    }
   }
 
   async function loadEvents() {
@@ -2638,6 +2723,10 @@
         persistCart();
       }
       if (changed) { state.awaySections = []; state.prevAway = null; state.selectedAway = []; }
+      try {
+        if (state.eventId != null) window.localStorage.setItem(EVENT_KEY, String(state.eventId));
+        else window.localStorage.removeItem(EVENT_KEY);
+      } catch (e) { /* not kept */ }
       if (state.eventId != null) loadSections(state.eventId, false);
       else clearEventCard();
       render();
@@ -2740,7 +2829,27 @@
       render();
     });
     // Load the match list right away; it is what you do first anyway.
-    loadEvents().then(render);
+    // After an automatic update of the extension this page still runs the old
+    // code, cut off from the extension: storage, notifications and the group
+    // no longer work. Say so; a refresh loads the new version (and resumes).
+    const alive = () => { try { return !!(ext && ext.runtime && ext.runtime.id); } catch (e) { return false; } };
+    const staleCheck = setInterval(() => {
+      if (alive()) return;
+      clearInterval(staleCheck);
+      const n = document.createElement('div');
+      n.className = 'nts-stale';
+      n.textContent = 'Seat Assist is bijgewerkt. Ververs dit tabblad om de nieuwe versie te gebruiken (een lopende zoekactie gaat daarna verder). ';
+      const b = document.createElement('button');
+      b.textContent = 'Verversen';
+      b.addEventListener('click', () => window.location.reload());
+      n.appendChild(b);
+      panel.querySelector('.nts-body').prepend(n);
+      log('⚠️ De extensie is bijgewerkt; ververs dit tabblad.');
+    }, 30000);
+
+    // Load the match list, bring back the chosen match, and resume a search
+    // that was running in this tab before the page loaded.
+    loadEvents().then(restoreSelection);
   }
 
   buildPanel();
