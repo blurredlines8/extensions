@@ -192,12 +192,14 @@
   // Seat cards in the cart: item id (for deleteitem) and event-block-seat_row.
   function parseCart(html) {
     const items = [];
-    const re = /data-seat-identifier="(\d+)"\s+data-combined-seat-identifier="(\d+)-(\d+)-(\d+)_(\d+)"/g;
+    // The price category follows on the same element; Herlaad needs it, as
+    // a seat in the cart is not in the (free seats only) mapping.
+    const re = /data-seat-identifier="(\d+)"\s+data-combined-seat-identifier="(\d+)-(\d+)-(\d+)_(\d+)"(?:\s+data-price-category-id="(\d+)")?/g;
     let m;
     while ((m = re.exec(html || ''))) {
       const block = Number(m[3]);
       items.push({ itemId: m[1], eventId: m[2], block, seatIdx: Number(m[4]), rowIdx: Number(m[5]),
-        seatId: block * 1e6 + Number(m[5]) * 1e3 + Number(m[4]) });
+        seatId: block * 1e6 + Number(m[5]) * 1e3 + Number(m[4]), priceCat: m[6] ? Number(m[6]) : null });
     }
     return items;
   }

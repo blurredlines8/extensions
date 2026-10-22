@@ -572,6 +572,47 @@
     } catch (e) { onError(e); }
   }
 
+  // Herlaad: take this match's seats out of the cart and put the same seats
+  // straight back, through the normal claim — for a seat that seems stuck.
+  // The category comes from the cart page itself (a carted seat is not in the
+  // free-seats mapping); the price option goes back to the default.
+  async function reloadCart() {
+    if (state.eventId == null) { log('Kies eerst de wedstrijd van je winkelwagen.'); return; }
+    try {
+      const items = core.parseCart(await (await shopFetch('/shoppingcart')).text())
+        .filter(it => Number(it.eventId) === state.eventId);
+      if (!items.length) { log('Niks in de winkelwagen om te herladen.'); return; }
+      if (Date.now() - state.venueAt > CLAIM_VENUE_MS) await loadVenue(state.eventId);
+      if (!state.venue || !state.venue.seatmap) { log('✗ Geen stoelplan voor deze wedstrijd; herladen kan nu niet.'); return; }
+      if (!state.blocks.length) await loadPlan();
+      await fetchMapping();
+      for (const it of items) if (it.priceCat != null && !state.mapping.seatCat.has(it.seatId)) state.mapping.seatCat.set(it.seatId, it.priceCat);
+      for (const b of new Set(items.map(it => it.block))) await getLabels(b);
+      log('🔄 Winkelwagen herladen (' + items.length + ' stoel(en))…');
+      for (const it of items) {
+        await shopFetch('/shoppingcart/deleteitem/itemId/' + it.itemId, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        });
+      }
+      state.cartSeats = [];
+      // Each seat on its own: one that is gone must not take the others along.
+      const mode = state.mode;
+      state.mode = 'loose';
+      let back = 0;
+      try { back = await claim(items.map(it => it.seatId)); } finally { state.mode = mode; }
+      log('🔄 Herladen klaar (' + back + '/' + items.length + ' terug in de winkelwagen).');
+      if (back) {
+        state.cartUntil = Date.now() + CART_HOLD_MS;
+        await syncCartTime();
+      } else {
+        state.cartUntil = 0;
+        saveCartPhase();
+        render();
+      }
+    } catch (e) { onError(e); }
+  }
+
   // A refused pick comes back as 404 {"snap":2,"alternative":"s<id>"}: the
   // seat would leave fewer than `snap` free seats next to it.
   function refusal(status, text) {
@@ -1658,7 +1699,8 @@
       '<div class="sat-body">' +
       '  <div class="sat-phase"></div>' +
       '  <div class="sat-row sat-cartbar"><button class="sat-start sat-pay">Afrekenen →</button>' +
-      '    <button class="sat-clear sat-clear-cart">🗑 Leegmaken</button></div>' +
+      '    <button class="sat-clear sat-clear-cart">🗑 Leegmaken</button>' +
+      '    <button class="sat-reload-cart" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad</button></div>' +
       '  <div class="sat-row sat-runbar"><button class="sat-stop">■ Stop</button>' +
       '    <button class="sat-edit" title="Stopt en gaat terug naar instellen">Wijzigen</button></div>' +
       '  <div class="sat-check"></div>' +
@@ -1682,7 +1724,8 @@
       '        <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +
       '      </select></label></div>' +
       '      <div class="sat-row"><input type="text" class="sat-armmatch" placeholder="Auto-start: wedstrijd waarvan de naam … bevat" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
-      '      <div class="sat-row"><button class="sat-clear sat-clear-more" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
+      '      <div class="sat-row"><button class="sat-reload-more" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad winkelwagen</button>' +
+      '        <button class="sat-clear sat-clear-more" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
       '    </details>' +
       '    <div class="sat-row"><button class="sat-start sat-go">▶ Start</button></div>' +
       '  </div>' +
@@ -1756,6 +1799,8 @@
     panel.querySelector('.sat-pay').addEventListener('click', () => { window.location.href = SHOP + '/shoppingcart'; });
     panel.querySelector('.sat-clear-cart').addEventListener('click', clearCart);
     panel.querySelector('.sat-clear-more').addEventListener('click', clearCart);
+    panel.querySelector('.sat-reload-cart').addEventListener('click', reloadCart);
+    panel.querySelector('.sat-reload-more').addEventListener('click', reloadCart);
     panel.querySelector('.sat-collapse').addEventListener('click', (e) => {
       panel.classList.toggle('sat-min');
       e.target.textContent = panel.classList.contains('sat-min') ? '+' : '–';
