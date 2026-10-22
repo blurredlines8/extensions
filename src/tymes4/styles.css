@@ -1,5 +1,5 @@
 /* Seat Assist — panel styles.
-   All rules are scoped under #nts-panel / #nts-banner so nothing leaks into the
+   All rules are scoped under #nts-panel so nothing leaks into the
    host shop page. Design tokens live on #nts-panel as CSS custom properties. */
 
 #nts-panel {
@@ -424,32 +424,193 @@
   opacity: 1;
 }
 
-/* Success banner (injected at the top of the page) */
-#nts-banner {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 2147483647;
+/* Header chip: what the monitor is doing, readable with the panel folded. */
+#nts-panel .nts-phasechip {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--nts-text);
+  white-space: nowrap;
+}
+#nts-panel .nts-phasechip:empty { display: none; }
+#nts-panel .nts-sub { font-weight: 400; color: var(--nts-faint); }
+
+/* Home sections as chips, numbered in your order of preference. The away
+   list (coaches, combi) keeps its own rows. */
+#nts-panel .nts-sections.nts-chipbox { gap: 8px; padding: 8px; min-height: 60px; max-height: 240px; }
+#nts-panel .nts-hint { font-size: 12px; color: var(--nts-muted); }
+#nts-panel .nts-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+#nts-panel .nts-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 4px 3px 8px;
+  font-size: 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--nts-bg);
+  border: 1px solid var(--nts-border-2);
+}
+#nts-panel .nts-chip:hover { background: var(--nts-surface-2); }
+#nts-panel .nts-chip.nts-sel { background: var(--nts-green-bg); border-color: var(--nts-green); color: var(--nts-green-text); font-weight: 600; }
+#nts-panel .nts-chip.nts-full .nts-chip-name { color: var(--nts-faint); }
+#nts-panel .nts-chip-n {
+  min-width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #eafff2;
+  background: var(--nts-green);
+}
+#nts-panel .nts-chip-free { font-size: 11px; color: var(--nts-green-text); font-variant-numeric: tabular-nums; }
+#nts-panel .nts-chip .nts-seatbtn { padding: 0 6px; font-size: 11px; border-radius: 999px; }
+#nts-panel .nts-chip:not(:hover) .nts-seatbtn { opacity: 0.55; }
+
+/* The log, folded away with its latest line in view. */
+#nts-panel .nts-logbox { flex: 0 0 auto; }
+#nts-panel .nts-logbox > summary { display: flex; gap: 8px; align-items: baseline; cursor: pointer; color: var(--nts-muted); font-size: 12px; user-select: none; }
+#nts-panel .nts-logbox[open] > summary { margin-bottom: 8px; }
+#nts-panel .nts-lastlog { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--nts-faint); }
+#nts-panel .nts-logbox[open] .nts-lastlog { display: none; }
+#nts-panel .nts-stand-name { font-size: 11px; font-weight: 600; color: var(--nts-muted); margin-bottom: 4px; }
+
+/* ------------------------------------------------------------------------
+   Phases, as in the TIXX panel: setup → wait (ready, not on sale for you
+   yet) → hunt (searching) → cart. Each shows only what matters then.
+   ------------------------------------------------------------------------ */
+#nts-panel .nts-setup { display: flex; flex-direction: column; gap: 10px; }
+#nts-panel[data-phase="wait"] .nts-setup,
+#nts-panel[data-phase="hunt"] .nts-setup,
+#nts-panel[data-phase="cart"] .nts-setup { display: none; }
+#nts-panel .nts-runbar,
+#nts-panel .nts-cartbar { display: none; }
+#nts-panel[data-phase="wait"] .nts-runbar,
+#nts-panel[data-phase="hunt"] .nts-runbar,
+#nts-panel[data-phase="cart"] .nts-cartbar { display: flex; }
+/* The old counter box is gone (the phase card shows the figure); the full
+   status card is folded under "Wedstrijdinfo" and only while setting up or
+   waiting. */
+#nts-panel .nts-counter { display: none; }
+#nts-panel[data-phase="hunt"] .nts-info,
+#nts-panel[data-phase="cart"] .nts-info,
+#nts-panel[data-phase="hunt"] .nts-check,
+#nts-panel[data-phase="cart"] .nts-check { display: none; }
+#nts-panel[data-phase="cart"] .nts-phasechip { color: var(--nts-green-text); }
+
+/* Phase card — same look as the TIXX panel. */
+#nts-panel .nts-phase:empty { display: none; }
+#nts-panel .nts-phase {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  background: var(--nts-surface);
+  border: 1px solid var(--nts-border);
+  border-radius: var(--nts-r-sm);
+}
+#nts-panel[data-phase="hunt"] .nts-phase { border-color: var(--nts-border-2); }
+#nts-panel[data-phase="cart"] .nts-phase { background: var(--nts-green-bg); border-color: rgba(111, 230, 161, 0.25); }
+#nts-panel .nts-ph-s.nts-dim { color: var(--nts-faint); }
+#nts-panel .nts-ph-s:empty { display: none; }
+#nts-panel .nts-info > summary { cursor: pointer; color: var(--nts-muted); font-size: 12px; user-select: none; }
+#nts-panel .nts-info[open] > summary { margin-bottom: 8px; }
+#nts-panel .nts-info { flex: 0 0 auto; }
+#nts-panel .nts-ph-k { font-size: 11px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; color: var(--nts-muted); }
+#nts-panel .nts-ph-t { font-weight: 600; margin-top: 2px; }
+#nts-panel .nts-ph-s { font-size: 12px; color: var(--nts-muted); }
+#nts-panel .nts-ph-big {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+#nts-panel[data-phase="cart"] .nts-ph-big { color: var(--nts-green-text); }
+#nts-panel .nts-ph-big.nts-urgent { color: var(--nts-red-text); }
+
+/* Checklist */
+#nts-panel .nts-check { display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto; }
+#nts-panel .nts-check:empty { display: none; }
+#nts-panel .nts-ck { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+#nts-panel .nts-ck-i {
+  flex: 0 0 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--nts-surface-2);
+  color: var(--nts-muted);
+}
+#nts-panel .nts-ck-ok .nts-ck-i { background: var(--nts-green-bg); color: var(--nts-green-text); }
+#nts-panel .nts-ck-warn .nts-ck-i { background: #3a2f10; color: #f3c969; }
+#nts-panel .nts-ck-bad .nts-ck-i { background: var(--nts-red-bg); color: var(--nts-red-text); }
+#nts-panel .nts-ck-bad .nts-ck-t { color: var(--nts-red-text); }
+#nts-panel .nts-ck-t { flex: 1; min-width: 0; }
+@media (prefers-color-scheme: light) {
+  #nts-panel .nts-ck-warn .nts-ck-i { background: #fdf3d8; color: #8a6100; }
+}
+
+/* Headings, icon buttons, main button, more options */
+#nts-panel .nts-h { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em; color: var(--nts-muted); }
+#nts-panel .nts-h .nts-sub { text-transform: none; letter-spacing: 0; flex: 1; }
+#nts-panel .nts-icon { padding: 2px 8px; font-size: 12px; color: var(--nts-muted); background: transparent; border-color: var(--nts-border); }
+#nts-panel .nts-go { flex: 1; padding: 9px 12px; font-size: 13.5px; font-weight: 600; }
+#nts-panel .nts-more > summary { cursor: pointer; color: var(--nts-muted); font-size: 12px; user-select: none; }
+#nts-panel .nts-more[open] > summary { margin-bottom: 8px; }
+#nts-panel .nts-more > .nts-row + .nts-row { margin-top: 8px; }
+
+/* Docked: a full-height bar on the right; the shop makes room for it (the
+   script sets the page margin and moves the shop's fixed parts aside). */
+#nts-panel .nts-dock {
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 14px 22px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 17px;
-  font-weight: 700;
-  color: #fff;
-  background: linear-gradient(90deg, #1f9d55, #158043);
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  justify-content: center;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--nts-muted);
+  background: transparent;
+  border: 1px solid var(--nts-border-2);
+  border-radius: var(--nts-r-xs);
 }
-#nts-banner button {
-  font-family: inherit;
-  font-size: 14px;
-  font-weight: 700;
-  color: #158043;
-  background: #fff;
-  border: none;
-  border-radius: 8px;
-  padding: 8px 16px;
-  cursor: pointer;
+#nts-panel.nts-docked {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 400px;
+  max-width: none;
+  max-height: none;
+  height: 100vh;
+  border-radius: 0;
+  border-width: 0 0 0 1px;
+  box-shadow: none;
 }
+#nts-panel.nts-docked .nts-head { cursor: default; }
+/* Folded while docked: a narrow strip with the phase chip running down it. */
+#nts-panel.nts-docked.nts-min { width: 44px; min-width: 0; }
+#nts-panel.nts-docked.nts-min .nts-head {
+  flex-direction: column;
+  height: 100%;
+  padding: 10px 0;
+  gap: 12px;
+  border-bottom: none;
+}
+#nts-panel.nts-docked.nts-min .nts-head > span:first-child { flex: 0 0 auto; font-size: 0; }
+#nts-panel.nts-docked.nts-min .nts-token { display: none; }
+#nts-panel.nts-docked.nts-min .nts-phasechip { writing-mode: vertical-rl; }
+#nts-panel.nts-docked.nts-min .nts-head > :last-child { order: -1; }
+
+/* Title on one line, as in the TIXX panel. */
+#nts-panel .nts-title { white-space: nowrap; }
+#nts-panel .nts-token { white-space: nowrap; }
+/* In the cart bar the buttons sit together, as in the TIXX panel. */
+#nts-panel .nts-cartbar .nts-reload { margin-left: 0; }

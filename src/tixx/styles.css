@@ -498,3 +498,199 @@
   padding: 5px 8px;
 }
 #sat-panel input[type="text"] { flex: 1; min-width: 0; }
+
+/* ------------------------------------------------------------------------
+   Phases: the panel shows what matters in the phase you are in.
+   setup → wait (ready, sale not open) → hunt (searching) → cart.
+   ------------------------------------------------------------------------ */
+#sat-panel .sat-setup { display: flex; flex-direction: column; gap: 10px; }
+#sat-panel[data-phase="wait"] .sat-setup,
+#sat-panel[data-phase="hunt"] .sat-setup,
+#sat-panel[data-phase="cart"] .sat-setup { display: none; }
+#sat-panel .sat-runbar,
+#sat-panel .sat-cartbar { display: none; }
+#sat-panel[data-phase="wait"] .sat-runbar,
+#sat-panel[data-phase="hunt"] .sat-runbar,
+#sat-panel[data-phase="cart"] .sat-cartbar { display: flex; }
+#sat-panel[data-phase="hunt"] .sat-check,
+#sat-panel[data-phase="cart"] .sat-check { display: none; }
+
+/* Phase chip in the header: readable with the panel collapsed. */
+#sat-panel .sat-phasechip {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--sat-text);
+}
+#sat-panel .sat-phasechip:empty { display: none; }
+#sat-panel[data-phase="cart"] .sat-phasechip { color: var(--sat-green-text); }
+
+/* Phase card */
+#sat-panel .sat-phase {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border);
+  border-radius: var(--sat-r-sm);
+}
+#sat-panel[data-phase="hunt"] .sat-phase { border-color: var(--sat-border-2); }
+#sat-panel[data-phase="cart"] .sat-phase { background: var(--sat-green-bg); border-color: rgba(111, 230, 161, 0.25); }
+#sat-panel .sat-ph-k { font-size: 11px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; color: var(--sat-muted); }
+#sat-panel .sat-ph-t { font-weight: 600; margin-top: 2px; }
+#sat-panel .sat-ph-big {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+#sat-panel[data-phase="cart"] .sat-ph-big { color: var(--sat-green-text); }
+#sat-panel .sat-ph-big.sat-urgent { color: var(--sat-red-text); }
+#sat-panel .sat-ph-s { font-size: 12px; color: var(--sat-muted); }
+#sat-panel .sat-dim { color: var(--sat-faint); }
+#sat-panel .sat-ph-s:empty { display: none; }
+
+/* Checklist */
+#sat-panel .sat-check { display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto; }
+#sat-panel .sat-check:empty { display: none; }
+#sat-panel .sat-ck { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+#sat-panel .sat-ck-i {
+  flex: 0 0 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--sat-surface-2);
+  color: var(--sat-muted);
+}
+#sat-panel .sat-ck-ok .sat-ck-i { background: var(--sat-green-bg); color: var(--sat-green-text); }
+#sat-panel .sat-ck-warn .sat-ck-i { background: #3a2f10; color: #f3c969; }
+#sat-panel .sat-ck-bad .sat-ck-i { background: var(--sat-red-bg); color: var(--sat-red-text); }
+#sat-panel .sat-ck-bad .sat-ck-t { color: var(--sat-red-text); }
+#sat-panel .sat-ck-t { flex: 1; min-width: 0; }
+#sat-panel .sat-ck-b { padding: 2px 8px; font-size: 11.5px; }
+@media (prefers-color-scheme: light) {
+  #sat-panel .sat-ck-warn .sat-ck-i { background: #fdf3d8; color: #8a6100; }
+}
+
+/* Section headings */
+#sat-panel .sat-h { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em; color: var(--sat-muted); }
+#sat-panel .sat-sub { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--sat-faint); flex: 1; }
+#sat-panel .sat-icon { padding: 2px 8px; font-size: 12px; color: var(--sat-muted); background: transparent; border-color: var(--sat-border); }
+#sat-panel .sat-go { flex: 1; padding: 9px 12px; font-size: 13.5px; font-weight: 600; }
+
+/* Blocks per stand */
+#sat-panel .sat-sections { gap: 8px; padding: 8px; min-height: 60px; max-height: 260px; }
+#sat-panel .sat-stand-name { font-size: 11px; font-weight: 600; color: var(--sat-muted); margin-bottom: 4px; }
+#sat-panel .sat-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+#sat-panel .sat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  font-size: 12px;
+  border-radius: 999px;
+  background: var(--sat-bg);
+  border: 1px solid var(--sat-border-2);
+}
+#sat-panel .sat-chip.sat-sel { background: var(--sat-green-bg); border-color: var(--sat-green); color: var(--sat-green-text); font-weight: 600; }
+/* Not on sale right now, but still watched: muted, never struck through, so
+   the name stays readable. A chosen one keeps its green outline. */
+#sat-panel .sat-chip.sat-off { color: var(--sat-faint); background: transparent; border-color: var(--sat-border); }
+#sat-panel .sat-chip.sat-off.sat-sel { color: var(--sat-green-text); border-color: var(--sat-green); background: transparent; font-weight: 600; }
+#sat-panel .sat-legend { font-size: 11px; color: var(--sat-faint); }
+#sat-panel .sat-chip.sat-full .sat-chip-name { color: var(--sat-faint); }
+#sat-panel .sat-chip.sat-ga { border-style: dashed; }
+#sat-panel .sat-chip-n {
+  min-width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #eafff2;
+  background: var(--sat-green);
+}
+#sat-panel .sat-chip-free { font-size: 11px; color: var(--sat-green-text); font-variant-numeric: tabular-nums; }
+#sat-panel .sat-chip-tag { font-size: 10px; padding: 0 5px; border-radius: 4px; background: var(--sat-surface-2); color: var(--sat-muted); }
+
+/* More options and the log: folded away until wanted. */
+#sat-panel details > summary { cursor: pointer; color: var(--sat-muted); font-size: 12px; user-select: none; }
+#sat-panel details[open] > summary { margin-bottom: 8px; }
+#sat-panel .sat-more > .sat-row + .sat-row { margin-top: 8px; }
+#sat-panel .sat-more input[type="text"] {
+  flex: 1;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--sat-text);
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-sm);
+  padding: 6px 8px;
+}
+#sat-panel .sat-logbox { flex: 0 0 auto; }
+#sat-panel .sat-logbox > summary { display: flex; gap: 8px; align-items: baseline; }
+#sat-panel .sat-lastlog {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--sat-faint);
+}
+#sat-panel .sat-logbox[open] .sat-lastlog { display: none; }
+/* While setting up, the checklist says it all; the card is for later phases. */
+#sat-panel[data-phase="setup"] .sat-phase { display: none; }
+
+/* Docked: a full-height bar on the right; the shop makes room for it (the
+   script sets the page margin and moves the shop's fixed parts aside). */
+#sat-panel .sat-dock {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--sat-muted);
+  background: transparent;
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-xs);
+}
+#sat-panel.sat-docked {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 400px;
+  max-width: none;
+  max-height: none;
+  height: 100vh;
+  border-radius: 0;
+  border-width: 0 0 0 1px;
+  box-shadow: none;
+}
+#sat-panel.sat-docked .sat-head { cursor: default; }
+/* Folded while docked: a narrow strip with the phase chip running down it. */
+#sat-panel.sat-docked.sat-min { width: 44px; min-width: 0; }
+#sat-panel.sat-docked.sat-min .sat-head {
+  flex-direction: column;
+  height: 100%;
+  padding: 10px 0;
+  gap: 12px;
+  border-bottom: none;
+}
+#sat-panel.sat-docked.sat-min .sat-head > span:first-child { flex: 0 0 auto; font-size: 0; }
+#sat-panel.sat-docked.sat-min .sat-token { display: none; }
+#sat-panel.sat-docked.sat-min .sat-phasechip { writing-mode: vertical-rl; }
+#sat-panel.sat-docked.sat-min .sat-head > :last-child { order: -1; }
+
+/* Title on one line, as in the Tymes4 panel. */
+#sat-panel .sat-title { white-space: nowrap; }
+#sat-panel .sat-token { white-space: nowrap; }

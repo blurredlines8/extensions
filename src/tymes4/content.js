@@ -10,18 +10,32 @@
   if (!API) return;
   const INTERVAL_MS = 5000;
   const CART_URL = location.origin + '/shopping-cart';
-  const SHOP_URL = location.origin + '/';
   // While there are no sections yet the monitor need not run at full speed;
   // that wait can last for days. The event record is refreshed on this same
   // slow cadence, since it changes rarely.
   const WAIT_INTERVAL_MS = 30000;
+  // Searching a sold-out match can go on for days. Once nothing has been free
+  // in your sections for QUIET_AFTER_MS, look every QUIET_INTERVAL_MS instead
+  // of every few seconds: a released seat usually stays a while, and it is
+  // kinder to the shop. Anything free, or your sale moment near: full speed.
+  const QUIET_AFTER_MS = 2 * 60 * 1000;
+  const QUIET_INTERVAL_MS = 30000;
 
   const state = {
     events: [],
     eventId: null,
     eventCategory: null,   // SaleCategoryId of the chosen event (varies per event type)
     sections: [],          // all sections of the event's category, sorted by name
-    selectedOrder: [],     // VenueBuildingBlockIds in priority order (click order)
+    selectedOrder: [],     // VenueBuildingBlockIds in priority order, from `prefs`
+    prefs: [],             // your home sections by name, in priority order (per club)
+    stadium: null,         // { sections: [{ name, stand }], at }: the home ground as last seen
+    cartUntil: 0,          // when the cart's hold runs out (shop's own clock)
+    hunt: null,            // { free, unit } for the search card: the figure that matters
+    quietSince: 0,         // since when nothing has been free in your sections (0 = something is)
+    channelKind: 'all',    // home matches: 'all' | 'regulier' | 'tweedekans'
+    note: '',              // one short line under it (away/placement cases)
+    freeAll: null,         // free seats in the whole stadium at the last look
+    cartSyncAt: 0,
     desiredSeats: {},      // vbbId -> Set of specific seat Ids (empty = first available)
     wantedCount: 1,
     timer: null,
@@ -63,9 +77,11 @@
   };
   // Mirror the shop's own request headers exactly: it sends the SSO cookie and a
   // "no-auth" flag alongside the bearer token, and the API's CORS allows both.
-  const headers = () => {
+  // `tok`: another sales channel's token (see channels below); without it the
+  // page's own token, as before.
+  const headers = tok => {
     const h = {
-      Authorization: 'Bearer ' + getToken(),
+      Authorization: 'Bearer ' + (tok || getToken()),
       'Content-Type': 'application/json',
       Accept: 'application/json',
       'no-auth': 'true',
@@ -82,8 +98,8 @@
   // ------------------------------------------------------------------ API ---
   // Raw event records: the status card needs fields that the mapping below
   // throws away (ButtonData, OnGeneralSaleFrom, …).
-  async function getEventsRaw() {
-    const res = await fetch(API + '/v2/Event', { credentials: 'omit', headers: headers() });
+  async function getEventsRaw(tok) {
+    const res = await fetch(API + '/v2/Event', { credentials: 'omit', headers: headers(tok) });
     if (!res.ok) throw new Error('Event HTTP ' + res.status);
     const data = await res.json();
     return data.TabItems.flatMap(t => t.Items);
@@ -94,18 +110,18 @@
     return items.map(i => ({ name: i.Name, eventId: i.EventId, saleCategoryId: i.SaleCategoryId }));
   }
 
-  async function getVenue(eventId) {
+  async function getVenue(eventId, tok) {
     const res = await fetch(API + '/v2/Venue/venue', {
-      method: 'POST', credentials: 'omit', headers: headers(),
+      method: 'POST', credentials: 'omit', headers: headers(tok),
       body: JSON.stringify({ PassePartoutId: null, EventIds: [eventId], InitiativeGuid: null }),
     });
     if (!res.ok) throw new Error('Venue HTTP ' + res.status);
     return res.json();
   }
 
-  async function getSection(vbbId, eventId) {
+  async function getSection(vbbId, eventId, tok) {
     const res = await fetch(API + '/v2/Availability/section', {
-      method: 'POST', credentials: 'omit', headers: headers(),
+      method: 'POST', credentials: 'omit', headers: headers(tok),
       body: JSON.stringify({ ParentVBBId: vbbId, GroupingId: null, EventIds: [eventId], PassePartoutIds: null, InitiativeGuid: null }),
     });
     if (!res.ok) throw new Error('Section HTTP ' + res.status);
@@ -162,10 +178,11 @@
   }
 
   // Returns 'ok' | 'unavailable' (definitively gone/not allowed) | 'error' (retry).
-  async function claimSeat(section, col) {
+  async function claimSeat(section, col, ch) {
+    const o = ch ? ch.order : state.cart;
     const body = {
-      PendingReservationId: state.cart.reservationId,
-      PendingReservationUID: state.cart.reservationUID,
+      PendingReservationId: o.reservationId,
+      PendingReservationUID: o.reservationUID,
       ParentVenueBuildingBlockId: section.VenueBuildingBlockId,
       Row: col.Row,
       Column: col.Column,
@@ -177,7 +194,7 @@
       InitiativeGuid: null,
     };
     const post = () => fetch(API + '/v2/Availability/select-position', {
-      method: 'POST', credentials: 'omit', headers: headers(), body: JSON.stringify(body),
+      method: 'POST', credentials: 'omit', headers: headers(ch && ch.token), body: JSON.stringify(body),
     });
     try {
       let res = await post();
@@ -194,8 +211,8 @@
       }
 
       if (data.ResultCode === 'OK' && data.UpdatedPendingReservation) {
-        state.cart.reservationId = data.UpdatedPendingReservation.PendingReservationId;
-        state.cart.reservationUID = data.UpdatedPendingReservation.PendingReservationUID;
+        o.reservationId = data.UpdatedPendingReservation.PendingReservationId;
+        o.reservationUID = data.UpdatedPendingReservation.PendingReservationUID;
         return 'ok';
       }
       log('  ✗ Niet gelukt (' + (data.ResultCode || 'onbekend') + ')');
@@ -458,17 +475,18 @@
   // Second half of the shop's own flow: move the held reservation into a
   // PendingOrder (the visible shopping cart). Without this the seat is reserved
   // server-side but never shows up in the cart. Returns true on success.
-  async function placeInOrder() {
+  async function placeInOrder(ch) {
+    const o = ch ? ch.order : state.cart;
     const body = {
-      PendingReservationId: state.cart.reservationId,
-      PendingReservationUID: state.cart.reservationUID,
-      PendingOrderId: state.cart.orderId,
-      PendingOrderUID: state.cart.orderUID,
+      PendingReservationId: o.reservationId,
+      PendingReservationUID: o.reservationUID,
+      PendingOrderId: o.orderId,
+      PendingOrderUID: o.orderUID,
       InitiativeGuid: null,
     };
     try {
       const res = await fetch(API + '/v2/PendingReservation/place-in-pendingorder', {
-        method: 'PUT', credentials: 'omit', headers: headers(), body: JSON.stringify(body),
+        method: 'PUT', credentials: 'omit', headers: headers(ch && ch.token), body: JSON.stringify(body),
       });
       if (!res.ok) { log('  place-in-pendingorder HTTP ' + res.status); return false; }
       const data = await res.json();
@@ -477,16 +495,21 @@
         return false;
       }
       // Remember the order so further seats join the same cart, and write it
-      // where the shop reads its cart from so the UI shows it.
-      state.cart.orderId = data.PendingOrderId;
-      state.cart.orderUID = data.PendingOrderUID;
-      try {
-        window.sessionStorage.setItem('shoppingCartData',
-          JSON.stringify({ PendingOrderId: data.PendingOrderId, PendingOrderUID: data.PendingOrderUID }));
-      } catch (e) { /* no sessionStorage access is not fatal */ }
+      // where the shop reads its cart from so the UI shows it — the page's
+      // own channel only; another channel's cart is shown when you check out.
+      o.orderId = data.PendingOrderId;
+      o.orderUID = data.PendingOrderUID;
+      if (!ch) {
+        try {
+          window.sessionStorage.setItem('shoppingCartData',
+            JSON.stringify({ PendingOrderId: data.PendingOrderId, PendingOrderUID: data.PendingOrderUID }));
+        } catch (e) { /* no sessionStorage access is not fatal */ }
+      } else {
+        saveChannelOrders();
+      }
       // Placing clears the reservation server-side; the next seat starts fresh.
-      state.cart.reservationId = null;
-      state.cart.reservationUID = null;
+      o.reservationId = null;
+      o.reservationUID = null;
       return true;
     } catch (e) {
       log('  place-in-pendingorder error: ' + e.message);
@@ -494,9 +517,9 @@
     }
   }
 
-  async function getOrderDetails(orderId, orderUID) {
+  async function getOrderDetails(orderId, orderUID, tok) {
     const res = await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(orderId) + '/details/' + encodeURIComponent(orderUID), {
-      method: 'GET', credentials: 'omit', headers: headers(),
+      method: 'GET', credentials: 'omit', headers: headers(tok),
     });
     if (!res.ok) { log('  order-details HTTP ' + res.status); return null; }
     return res.json();
@@ -518,6 +541,8 @@
           spots: p.spots || null,
           placementIds: p.placementIds || null,
           col: p.col ? { Row: p.col.Row, Column: p.col.Column, RowNumber: p.col.RowNumber, SeatNumber: p.col.SeatNumber, Id: p.col.Id } : null,
+          channel: p.channel || null,
+          channelLabel: p.channelLabel || null,
         })),
       }));
     } catch (e) { /* sessionStorage may fail; not fatal */ }
@@ -534,7 +559,10 @@
       state.cart.placed = Array.isArray(c.placed) ? c.placed : [];
       state.cart.acquired = state.cart.placed.length;
       if (state.cart.placed.length) {
-        log('↩️ Winkelwagen-context hersteld: ' + state.cart.placed.length + ' stoel(en). "🔄 Herlaad" is available.');
+        log('↩️ Winkelwagen-context hersteld: ' + state.cart.placed.length + ' stoel(en).');
+        // Back to the cart phase; the shop's clock (syncCartTime, after the
+        // channels are known) decides whether the hold is still running.
+        state.cart.done = true;
       }
     } catch (e) { /* ignore a corrupt context */ }
   }
@@ -563,12 +591,39 @@
       });
     } catch (e) { log('  clear error: ' + e.message); }
 
-    // Fresh start: the next placement creates a new order.
+    // Fresh start: the next placement creates a new order. Seats in another
+    // sales channel's cart are not in this order and stay listed.
     state.cart.orderId = null; state.cart.orderUID = null;
     state.cart.reservationId = null; state.cart.reservationUID = null;
-    state.cart.placed = [];
+    state.cart.placed = (state.cart.placed || []).filter(p => p.channel);
     persistCart();
     try { window.sessionStorage.removeItem('shoppingCartData'); } catch (e) { /* ok */ }
+    return { removed: gone, total: seatLines.length };
+  }
+
+  async function emptyChannelOrder(id) {
+    const o = chan.orders[id];
+    if (!o || !o.orderId) return { removed: 0, total: 0 };
+    const tok = await channelToken(id);
+    const details = await getOrderDetails(o.orderId, o.orderUID, tok);
+    const lines = (details && (details.OrderLines
+      || (details.PendingOrderDetails && details.PendingOrderDetails.OrderLines))) || [];
+    const seatLines = lines.filter(l => l.ProductType !== 2 && l.ProductType !== 3 && l.Id != null);
+    let gone = 0;
+    for (const l of seatLines) {
+      const res = await fetch(API + '/v2/PendingOrderLine/' + encodeURIComponent(l.Id) +
+        '/' + encodeURIComponent(o.orderId) + '/' + encodeURIComponent(o.orderUID), {
+        method: 'DELETE', credentials: 'omit', headers: headers(tok),
+      });
+      if (res.ok) gone++;
+    }
+    await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(o.orderId) + '/clear/' + encodeURIComponent(o.orderUID), {
+      method: 'GET', credentials: 'omit', headers: headers(tok),
+    });
+    chan.orders[id] = { reservationId: null, reservationUID: null, orderId: null, orderUID: null };
+    saveChannelOrders();
+    state.cart.placed = (state.cart.placed || []).filter(p => p.channel !== id);
+    persistCart();
     return { removed: gone, total: seatLines.length };
   }
 
@@ -585,7 +640,8 @@
         if (o) { orderId = o.PendingOrderId; orderUID = o.PendingOrderUID; }
       } catch (e) { /* no cart is fine */ }
     }
-    if (!orderId) { log('Er staat niets in de winkelwagen.'); return; }
+    const others = Object.keys(chan.orders).map(Number).filter(id => chan.orders[id] && chan.orders[id].orderId);
+    if (!orderId && !others.length) { log('Er staat niets in de winkelwagen.'); return; }
     if (!window.confirm('Alle kaarten uit de winkelwagen halen?\n\n' +
         'Ze worden vrijgegeven en kunnen door iemand anders worden gepakt. ' +
         'Dit kan niet ongedaan worden gemaakt.')) return;
@@ -593,13 +649,21 @@
     ui.clearBtn.disabled = true;
     try {
       log('🗑 Winkelwagen leegmaken\u2026');
-      const r = await emptyOrder(orderId, orderUID);
+      const r = orderId ? await emptyOrder(orderId, orderUID) : { removed: 0, total: 0 };
+      for (const id of others) {
+        const x = await emptyChannelOrder(id);
+        r.removed += x.removed;
+        r.total += x.total;
+      }
       state.cart.acquired = 0;
       state.cart.attempted = new Set();
       state.cart.done = false;
       state.prevKeys = null;
       log('🗑 ' + r.removed + '/' + r.total + ' regel(s) verwijderd; winkelwagen is leeg.');
-      ui.counter.textContent = 'Vrij nu: —';
+      status('', null);
+      state.cartUntil = 0;
+      state.cart.placed = [];
+      render();
     } catch (e) {
       log('Leegmaken mislukt: ' + e.message);
     } finally {
@@ -611,7 +675,8 @@
   // again — a clean slate for when a seat appears to be "stuck". Does exactly
   // what the shop does (DELETE the lines, clear the order) and rebuilds after.
   async function reloadCart() {
-    const placed = (state.cart.placed || []).slice();
+    // Seats from another sales channel are in that channel's cart: not here.
+    const placed = (state.cart.placed || []).filter(p => !p.channel);
     if (!state.cart.orderId || !placed.length) { log('Niks in de winkelwagen om te herladen.'); return; }
     if (state.reloading) return;
     state.reloading = true;
@@ -654,6 +719,187 @@
     }
   }
 
+  // ------------------------------------------------------------ channels ---
+  // NEC sells through more than one sales channel in the same shop: "Ticketshop
+  // Regulier" (1) and "Ticketshop secundair" (7, the second-chance sale). The
+  // shop switches with GET /v2/Account/token/channel/<id>: a new token whose
+  // only difference is salesChannelId; same host, same events, same seats.
+  // For home matches the monitor looks in every channel you choose, each with
+  // its own token and its own cart, like the TIXX panel's "alles / alleen
+  // verkoop / alleen Ticketbörse". That token stays in memory — the page keeps
+  // its own channel until you check out there. Away matches: page channel only.
+  const CHANNEL_KEY = 'ntsChannels';
+  const ORDERS_KEY = 'ntsChannelOrders';
+  const chan = { list: null, tokens: new Map(), orders: {}, failed: new Set() };
+
+  const pageChannel = () => {
+    const c = decodeJwt(getToken() || '');
+    return c && c.salesChannelId ? Number(c.salesChannelId) : 1;
+  };
+  // "regulier" for a top-level channel, "tweedekans" for one under it.
+  const channelLabel = c => (c && c.ParentId ? 'tweedekans' : 'regulier');
+
+  async function loadChannels() {
+    if (chan.list) return chan.list;
+    try {
+      const res = await fetch(API + '/v2/SalesChannel/list', { credentials: 'omit', headers: headers() });
+      const all = res.ok ? await res.json() : [];
+      chan.list = (all || []).filter(c => c.Active && c.UserSelectable);
+    } catch (e) { chan.list = []; }
+    try { chan.orders = JSON.parse(window.sessionStorage.getItem(ORDERS_KEY) || '{}'); } catch (e) { chan.orders = {}; }
+    return chan.list;
+  }
+
+  // 'all', or one label ('regulier' / 'tweedekans').
+  function channelInScope(id) {
+    if (state.channelKind === 'all' || !chan.list) return true;
+    const c = chan.list.find(x => x.Id === id);
+    return !c || channelLabel(c) === state.channelKind;
+  }
+
+  // A token for another channel, fetched with the page's own token exactly as
+  // the shop's switch does, renewed an hour before it expires.
+  async function channelToken(id) {
+    const have = chan.tokens.get(id);
+    const page = decodeJwt(getToken() || '');
+    if (have && have.exp - Date.now() > 3600e3 && page && have.customerId === page.customerId) return have.token;
+    const res = await fetch(API + '/v2/Account/token/channel/' + id, { credentials: 'omit', headers: headers() });
+    if (!res.ok) throw new Error('token/channel/' + id + ' HTTP ' + res.status);
+    const data = await res.json();
+    const c = decodeJwt(data.Token || '');
+    if (!c || Number(c.salesChannelId) !== id) throw new Error('onverwacht token voor kanaal ' + id);
+    chan.tokens.set(id, { token: data.Token, exp: c.exp * 1000, customerId: c.customerId });
+    return data.Token;
+  }
+
+  function saveChannelOrders() {
+    try { window.sessionStorage.setItem(ORDERS_KEY, JSON.stringify(chan.orders)); } catch (e) { /* not kept */ }
+  }
+
+  // The same pass as the page channel's, in each other channel in scope: your
+  // sections (by name), their free seats, the same claim. Only for home
+  // matches; the away flow is never involved.
+  async function scanOtherChannels() {
+    if (state.cart.done) return;
+    const list = await loadChannels();
+    const page = pageChannel();
+    let extra = 0;
+    for (const c of list) {
+      if (c.Id === page || !channelInScope(c.Id) || chan.failed.has(c.Id) || state.cart.done) continue;
+      const label = channelLabel(c);
+      let tok;
+      try { tok = await channelToken(c.Id); } catch (e) {
+        chan.failed.add(c.Id);
+        log('⚠️ Kanaal ' + label + ' niet bereikbaar (' + e.message + '); ik kijk alleen in het kanaal van deze pagina.');
+        continue;
+      }
+      const order = chan.orders[c.Id] || (chan.orders[c.Id] = { reservationId: null, reservationUID: null, orderId: null, orderUID: null });
+      const ch = { id: c.Id, label, token: tok, order };
+      const venue = await getVenue(state.eventId, tok);
+      if (!isHomeVenue(venue.Sections)) continue;
+      const ordered = prefsFor(venue.Sections);
+      const avail = x => x.HasTicketsAvailable === true || x.HasMarketplaceTicketsAvailable === true;
+      let secs = venue.Sections.filter(avail);
+      if (ordered) {
+        const prio = new Map(ordered.map((v, i) => [v, i]));
+        secs = secs.filter(x => prio.has(x.VenueBuildingBlockId))
+          .sort((a, b) => prio.get(a.VenueBuildingBlockId) - prio.get(b.VenueBuildingBlockId));
+      }
+      for (const section of secs) {
+        if (state.cart.done) break;
+        const detail = await getSection(section.VenueBuildingBlockId, state.eventId, tok);
+        if (isUnplacedDetail(detail)) continue;   // spots without seat numbers: not in this pass
+        const seats = detail.Rows.flatMap(r => r.Columns)
+          .filter(col => isSeat(col) && (col.IsAvailableForSale === true || col.AvailableForSecondary === true));
+        extra += seats.length;
+        if (seats.length) await claimSeats(section, seats, ch);
+      }
+    }
+    if (extra && state.hunt) status(state.note, { free: state.hunt.free + extra, unit: state.hunt.unit + ' · ' + extra + ' via tweedekans' });
+  }
+
+  // Check out: seats from another channel sit in that channel's cart, which
+  // the shop shows once the page is in that channel — so switch the page there
+  // exactly as the shop's own switch does (its token in the session), then open
+  // the cart.
+  function checkout(channelId) {
+    if (channelId && channelId !== pageChannel()) {
+      const t = chan.tokens.get(channelId);
+      const o = chan.orders[channelId];
+      if (t && o && o.orderId) {
+        try {
+          window.sessionStorage.setItem('jwt', t.token);
+          window.sessionStorage.setItem('shoppingCartData', JSON.stringify({ PendingOrderId: o.orderId, PendingOrderUID: o.orderUID }));
+        } catch (e) { /* fall through to the cart page */ }
+      }
+    }
+    window.location.href = CART_URL;
+  }
+
+  // What the search card shows: a figure (free seats, spots or away sections)
+  // and/or a short note. Display only; the monitor's decisions do not use it.
+  function status(note, hunt) {
+    state.note = note || '';
+    if (hunt !== undefined) state.hunt = hunt;
+    // Also the clock for quiet searching: since when has nothing been free.
+    // Home matches only — the away flow keeps its own pace.
+    if (!state.homeNow || (hunt && hunt.free > 0)) state.quietSince = 0;
+    else if (hunt && !state.quietSince) state.quietSince = Date.now();
+    if (ui.panel) renderPhaseCard(phase());
+  }
+
+  // ------------------------------------------------------------- stadium ---
+  // Your home sections are kept by name per club, in extension storage (one
+  // for every tab and container), so you can set them before a match has any
+  // sections — before your phase the venue lists none. Only home matches have
+  // sections at all; away matches (coaches, combi tickets) never do and are
+  // left exactly as they were: there the preference simply does not apply.
+  const ext = typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null);
+  const STADIUM_KEY = 'tymes4:stadium:' + location.origin;
+  const PREFS_KEY = 'tymes4:sections:' + location.origin;
+  const COUNT_KEY = 'ntsWantedCount';
+  // More sections than an away allocation ever has (see relaxCategory).
+  const isHomeVenue = sections => sections.length > 3;
+
+  async function storeGet(key) {
+    try {
+      if (!ext || !ext.storage || !ext.storage.local) return null;
+      const r = await ext.storage.local.get(key);
+      return r ? r[key] : null;
+    } catch (e) { return null; }
+  }
+  async function storeSet(key, value) {
+    try { if (ext && ext.storage && ext.storage.local) await ext.storage.local.set({ [key]: value }); } catch (e) { /* not kept */ }
+  }
+
+  // Each section with its stand (ParentVenueBuildingBlockName, e.g.
+  // "Hazenkamptribune"). NEC, two home matches: 30 of 30 the same, ids too.
+  function learnStadium(sections) {
+    if (!isHomeVenue(sections)) return;
+    const next = sections
+      .map(x => ({ name: x.Name, stand: x.ParentVenueBuildingBlockName || null }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'nl', { numeric: true }));
+    const key = list => list.map(x => x.name + '|' + x.stand).join(',');
+    const old = state.stadium ? state.stadium.sections : [];
+    if (key(old) === key(next)) return;
+    state.stadium = { sections: next, at: Date.now() };
+    storeSet(STADIUM_KEY, state.stadium);
+    log('🏟 Stadion onthouden: ' + next.length + ' vakken. Je voorkeur geldt voortaan voor elke thuiswedstrijd.');
+  }
+
+  // Names → this venue's VenueBuildingBlockIds. A preference only means
+  // something on the home ground; elsewhere every section counts, as before.
+  function prefsFor(sections) {
+    if (!state.prefs.length || !isHomeVenue(sections)) return null;
+    const vbb = new Map(sections.map(x => [x.Name, x.VenueBuildingBlockId]));
+    return state.prefs.map(n => vbb.get(n)).filter(v => v != null);
+  }
+
+  function applyPrefs() {
+    const order = prefsFor(state.sections);
+    state.selectedOrder = order || [];
+  }
+
   // -------------------------------------------------------------- monitor ---
   // One monitor for both kinds of event; which kind it is follows from the
   // venue map itself:
@@ -675,7 +921,10 @@
     const opensAt = state.watch.opensAt ? state.watch.opensAt.getTime() : null;
     const burst = opensAt != null && Math.abs(opensAt - now) < 2 * 60 * 1000;
     if (state.lastSections === 0 && !burst && state.lastPoll && now - state.lastPoll < WAIT_INTERVAL_MS) return;
+    const quiet = !burst && state.quietSince && now - state.quietSince > QUIET_AFTER_MS;
+    if (quiet && state.lastPoll && now - state.lastPoll < QUIET_INTERVAL_MS) return;
     state.lastPoll = now;
+    state.nextAt = now + (state.lastSections === 0 && !burst ? WAIT_INTERVAL_MS : quiet ? QUIET_INTERVAL_MS : INTERVAL_MS);
 
     try {
       // The event record changes slowly; do not fetch it every round.
@@ -697,7 +946,12 @@
       }
 
       const venue = await getVenue(state.eventId);
+      state.homeNow = isHomeVenue(venue.Sections);
+      learnStadium(venue.Sections);
+      const ordered = prefsFor(venue.Sections);
+      if (ordered) state.selectedOrder = ordered;
       const vs = summarisePlacements(venue);
+      state.freeAll = vs.available;
       if (state.evRecord) renderWatchCard(state.evRecord, vs);
       reportVenueChanges(vs);
       // Set from the venue here; the away branch below overrides it when it
@@ -721,7 +975,9 @@
         (s.HasTicketsAvailable === true || s.HasMarketplaceTicketsAvailable === true);
 
       let secs;
-      if (state.selectedOrder.length) {
+      // With a home preference only those sections, even when none is listed
+      // yet; without one (or away) every section that has seats.
+      if (state.selectedOrder.length || ordered) {
         const priority = new Map(state.selectedOrder.map((v, i) => [v, i]));
         secs = venue.Sections
           .filter(s => isAvail(s) && priority.has(s.VenueBuildingBlockId))
@@ -750,7 +1006,7 @@
             // monitor leaves wait mode and polls at full speed.
             state.lastSections = vrij;
             if (onSale || state.tryEarly) { await claimAwaySection(away); return; }
-            ui.counter.textContent = vrij + '/' + away.length + ' secties vrij · ' + nowStr();
+            status('', { free: vrij, unit: 'van ' + away.length + ' secties vrij' });
             return;
           }
         }
@@ -763,9 +1019,12 @@
           await claimSpotsByPlacements(venue);
           return;
         }
-        ui.counter.textContent = vs.sections
-          ? 'Nog niets vrij in je voorkeursvak(ken) · ' + nowStr()
-          : 'Wachten op vakken · gecontroleerd ' + nowStr();
+        if (vs.sections) {
+          status('', { free: 0, unit: 'vrij in jouw vakken' });
+          if (isHomeVenue(venue.Sections)) await scanOtherChannels();
+        } else {
+          status('wacht tot de vakken er zijn', null);
+        }
         return;
       }
 
@@ -799,11 +1058,17 @@
 
       updateChurn(currentKeys, gathered);
 
-      for (const g of gathered) {
-        if (state.cart.done) break;
-        if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
-        if (g.spots !== 0) await claimSpots(g.section, g.spots);
+      // Home matches look in every sales channel you chose; away matches
+      // stay exactly as before (page channel only).
+      const home = isHomeVenue(venue.Sections);
+      if (!home || channelInScope(pageChannel())) {
+        for (const g of gathered) {
+          if (state.cart.done) break;
+          if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
+          if (g.spots !== 0) await claimSpots(g.section, g.spots);
+        }
       }
+      if (home) await scanOtherChannels();
     } catch (e) {
       log('Fout: ' + e.message);
     }
@@ -818,7 +1083,7 @@
       ? state.selectedAway.map(id => sections.find(a => a.VenueBuildingBlockId === id)).filter(Boolean)
       : sections;
     const open = order.filter(a => a.HasAvailability);
-    if (!open.length) { ui.counter.textContent = 'Niets vrij in je secties · ' + nowStr(); return; }
+    if (!open.length) { status('', { free: 0, unit: 'vrij in jouw secties' }); return; }
 
     let wanted = state.wantedCount - state.cart.acquired;
     const r = state.right;
@@ -826,7 +1091,7 @@
       log('  kooprecht staat ' + r.AmountSelectable + ' toe; gewenst ' + wanted + ' — aantal verlaagd.');
       wanted = r.AmountSelectable;
     }
-    if (wanted <= 0) { ui.counter.textContent = 'Kooprecht op · ' + nowStr(); return; }
+    if (wanted <= 0) { status('je kooprecht is op'); return; }
 
     for (const sec of open) {
       if (state.cart.done) break;
@@ -856,7 +1121,7 @@
     if (state.cart.done) return;
     const epf = (venue.Filters && venue.Filters.EventPlacementFilters) || [];
     const priced = epf.filter(x => x.BasePrice != null);
-    if (!priced.length) { ui.counter.textContent = 'Geen geprijsde placements · ' + nowStr(); return; }
+    if (!priced.length) { status('nog geen geprijsde plekken'); return; }
     // Placements come in price groups (Cambuur: 5× €40,50 and 1× €22,00 — the
     // odd one is a reduced rate). Passing all ids at once lets find-my-seat hand
     // out a rate you may not be entitled to, so try the largest group first and
@@ -877,8 +1142,8 @@
       log('  kooprecht staat ' + r.AmountSelectable + ' toe; gewenst ' + wanted + ' — aantal verlaagd.');
       wanted = r.AmountSelectable;
     }
-    if (wanted <= 0) { ui.counter.textContent = 'Kooprecht op · ' + nowStr(); return; }
-    ui.counter.textContent = 'Kopen via placements ' + ids.join(',') + ' · ' + nowStr();
+    if (wanted <= 0) { status('je kooprecht is op'); return; }
+    status('kopen via placements ' + ids.join(', '));
 
     let got = 0;
     const amounts = [wanted, Math.min(4, wanted), 1].filter((v, i, a) => v > 0 && a.indexOf(v) === i);
@@ -903,7 +1168,7 @@
   }
 
   // Home fixture: seat by seat, in the priority order you picked.
-  async function claimSeats(section, seats) {
+  async function claimSeats(section, seats, ch) {
     const desired = state.desiredSeats[section.VenueBuildingBlockId];
     const pool = (desired && desired.size) ? seats.filter(c => desired.has(c.Id)) : seats;
     for (const col of pool) {
@@ -911,14 +1176,14 @@
       const key = section.VenueBuildingBlockId + ':' + col.Id;
       if (state.cart.attempted.has(key)) continue;
 
-      log('➡️ Poging: ' + section.Name + ' — rij ' + col.RowNumber + ', stoel ' + col.SeatNumber);
-      const result = await claimSeat(section, col);
+      log('➡️ Poging' + (ch ? ' (' + ch.label + ')' : '') + ': ' + section.Name + ' — rij ' + col.RowNumber + ', stoel ' + col.SeatNumber);
+      const result = await claimSeat(section, col, ch);
       if (result === 'ok' || result === 'unavailable') state.cart.attempted.add(key);
       if (result !== 'ok') continue;
 
       log('  · vastgehouden, in winkelwagen plaatsen…');
-      if (!await placeInOrder()) continue;
-      state.cart.placed.push({ section, col });
+      if (!await placeInOrder(ch)) continue;
+      state.cart.placed.push(ch ? { section, col, channel: ch.id, channelLabel: ch.label } : { section, col });
       state.cart.acquired++;
       persistCart();
       log('  ✓ In winkelwagen: ' + section.Name + ' rij ' + col.RowNumber + ' stoel ' + col.SeatNumber +
@@ -996,10 +1261,8 @@
       .reduce((a, g) => a + g.spots, 0);
     const heeftPlekken = (gathered || []).some(g => g.spots != null);
 
-    ui.counter.textContent = heeftPlekken
-      ? 'Vrije spots: ' + spots + ' · ' + nowStr()
-      : 'Vrij nu: ' + currentKeys.size +
-        (prev ? '  ·  +' + added + ' / -' + removed + '  (totaal bijgekomen: ' + state.totalAppeared + ')' : '');
+    status(prev && state.totalAppeared ? state.totalAppeared + ' bijgekomen sinds de start' : '',
+      heeftPlekken ? { free: spots, unit: 'plekken vrij' } : { free: currentKeys.size, unit: 'vrij in jouw vakken' });
     if (prev && (added || removed)) {
       log('🔄 ' + currentKeys.size + ' vrij · +' + added + ' bij / -' + removed + ' weg');
     }
@@ -1252,9 +1515,13 @@
       card.appendChild(f);
     }
 
-    placementLines(vs).forEach(t => card.appendChild(el('div', 'nts-wc-pl', t)));
+    // Placement ids are for an away fixture without cross-sell sections (see
+    // placementLines); on a home match with sections they are only noise.
+    if (vs && !vs.sections && !state.awaySections.length) placementLines(vs).forEach(t => card.appendChild(el('div', 'nts-wc-pl', t)));
     card.appendChild(el('div', 'nts-wc-foot', 'laatste check ' + nowStr()));
+    state.evRecord = ev;
     updateCountdown();
+    render();
   }
 
   // The card should appear as soon as you pick an event. We already have the
@@ -1280,7 +1547,29 @@
   }
 
   // Runs every second so the countdown does not sit still for 30s.
+  // The header chip: what the monitor is doing, visible with the panel folded.
+  const mmss = ms => { const t = Math.max(0, Math.round(ms / 1000)); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); };
+
+  function renderChip() {
+    if (!ui.chip) return;
+    const now = Date.now();
+    if (state.cart.done && state.cartUntil) {
+      const left = state.cartUntil - now;
+      ui.chip.textContent = left > 0 ? '🎟 ' + mmss(left) : '⌛ verlopen';
+      if (left <= 0 && ui.panel.getAttribute('data-phase') === 'cart') render();
+      if (left > 0 && now - state.cartSyncAt > 60000) { state.cartSyncAt = now; syncCartTime(); }
+      return;
+    }
+    const at = state.watch.opensAt;
+    const left = at ? at.getTime() - now : 0;
+    const ph = ui.panel.getAttribute('data-phase');
+    ui.chip.textContent = ph === 'wait' ? '⏳ ' + (left > 0 ? clock(left) : 'klaar')
+      : ph === 'hunt' ? '🔎 ' + (state.hunt ? state.hunt.free + ' vrij' : 'zoekt') : '';
+  }
+
   function updateCountdown() {
+    renderChip();
+    if (ui.panel) renderPhaseCard(ui.panel.getAttribute('data-phase'));
     if (!ui.watchCountdown) return;
     const at = state.watch.opensAt;
     if (!at) { ui.watchCountdown.textContent = ''; return; }
@@ -1352,11 +1641,7 @@
   }
 
   async function onSaleOpen(ev) {
-    log('🎉 VERKOOP OPEN voor "' + ev.Name + '" — ga naar de shop!');
-    const route = (ev.DeepLinkRoute || '').trim();
-    let href = SHOP_URL;
-    try { if (route) href = new URL(route, SHOP_URL).href; } catch (e) { /* fall back to the shop home */ }
-    showBanner('🎉 ' + ev.Name + ' is in verkoop!', 'Naar de shop →', href);
+    log('🎉 VERKOOP OPEN voor "' + ev.Name + '"');
     beep();
     flashTitle('🎟️ IN VERKOOP');
 
@@ -1366,13 +1651,13 @@
       const venue = await getVenue(state.eventId);
       const secs = venue.Sections.filter(s => s.SaleCategoryId === state.eventCategory);
       if (secs.length) {
-        log('🪑 Er is nu een plattegrond (' + secs.length + ' vak(ken)) — zet de modus op "Stoelen", ververs en start de scan.');
+        log('🪑 Er is nu een plattegrond (' + secs.length + ' vak(ken)).');
       }
     } catch (e) { /* the alarm has already fired; this is a bonus */ }
   }
 
   // The tab title is the only signal you still notice when the tab is in the
-  // background; the banner and the beep require you to look or listen.
+  // background; the beep requires you to listen.
   function flashTitle(text) {
     if (state.watch.title === null) state.watch.title = document.title;
     document.title = text + ' · ' + state.watch.title;
@@ -1401,14 +1686,15 @@
     state.prevKeys = null;
     state.totalAppeared = 0;
     state.lastPoll = 0;
+    state.quietSince = 0;
     state.watch.prev = null;
     state.watch.prevVenue = null;
     state.watch.alerted = false;
     state.watch.loginWarned = false;
-    ui.counter.textContent = 'Vrij nu: —';
+    status('', null);
 
-    const names = state.selectedOrder.length
-      ? state.selectedOrder.map((v, i) => (i + 1) + '. ' + nameByVbb(v)).join('  ')
+    const names = state.prefs.length && (!state.sections.length || isHomeVenue(state.sections))
+      ? state.prefs.map((n, i) => (i + 1) + '. ' + n).join('  ')
       : (state.sections.length ? 'alle vakken' : 'nog geen vakken — we wachten tot ze verschijnen');
     log('▶️ Gestart · ' + names + ' · gewenst: ' + state.wantedCount);
     setRunning(true);
@@ -1422,21 +1708,223 @@
     setRunning(false);
   }
 
-  function setRunning(on) {
-    ui.startBtn.disabled = on;
-    ui.stopBtn.disabled = !on;
+  function setRunning() { render(); }
+
+  // The shop's own countdown: seconds left on the pending order.
+  async function syncCartTime() {
+    let { orderId, orderUID } = state.cart;
+    let tok = null;
+    if (!orderId) {
+      const id = Object.keys(chan.orders).map(Number).find(k => chan.orders[k] && chan.orders[k].orderId);
+      if (id == null) return;
+      ({ orderId, orderUID } = chan.orders[id]);
+      try { tok = await channelToken(id); } catch (e) { return; }
+    }
+    if (!orderId || !orderUID) return;
+    try {
+      const res = await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(orderId) + '/expiration/' + encodeURIComponent(orderUID), {
+        credentials: 'omit', headers: headers(tok),
+      });
+      const sec = res.ok ? Number(await res.text()) : NaN;
+      if (Number.isFinite(sec)) state.cartUntil = Date.now() + sec * 1000;
+    } catch (e) { /* keep the estimate */ }
   }
 
   function onSuccess() {
     state.cart.done = true;
+    state.cartUntil = Date.now() + 20 * 60 * 1000;
+    state.cartSyncAt = Date.now();
+    syncCartTime();
     stop();
     log('🎟️ ' + state.cart.acquired + ' plaats(en) staan in je winkelwagen — rond af!');
-    showBanner();
+    ui.panel.classList.remove('nts-min');
+    ui.collapse.textContent = '–';
+    if (dock.on) applyDock();
+    render();
     beep();
   }
 
   // ------------------------------------------------------------------- UI ---
+  // The panel follows the phase you are in, like the TIXX panel: setting up
+  // (status card + checklist + choices), ready (running, not on sale for you
+  // yet: the status card counts down), searching (the counter), and seats in
+  // the cart (the shop's own countdown). Away matches (coaches, combi) go
+  // through exactly the same monitor as before; only the layout changed.
   const ui = {};
+
+  function phase() {
+    if (state.cart.done && state.cartUntil > Date.now()) return 'cart';
+    if (!state.timer) return 'setup';
+    const ev = state.evRecord;
+    const open = ev && (isOnSale(ev) || state.tryEarly);
+    return open && state.lastSections > 0 ? 'hunt' : 'wait';
+  }
+
+  function render() {
+    if (!ui.panel) return;
+    const ph = phase();
+    ui.panel.setAttribute('data-phase', ph);
+    renderChip();
+    renderCheck(ph);
+    renderPhaseCard(ph);
+  }
+
+  const hhmm = d => d.toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
+
+  // What is set up and what is not, in view instead of scrolling past in the
+  // log. A red line turns the main button into "Toch …".
+  function renderCheck(ph) {
+    const c = ui.check;
+    if (!c) return;
+    c.textContent = '';
+    if (ph === 'hunt' || ph === 'cart') return;
+    let bad = 0;
+    const add = (status, text) => {
+      if (status === 'bad') bad++;
+      const row = document.createElement('div');
+      row.className = 'nts-ck nts-ck-' + status;
+      const i = document.createElement('span');
+      i.className = 'nts-ck-i';
+      i.textContent = { ok: '✓', warn: '!', bad: '✗', info: '•' }[status];
+      const t = document.createElement('span');
+      t.className = 'nts-ck-t';
+      t.textContent = text;
+      row.append(i, t);
+      c.appendChild(row);
+    };
+    const sess = state.session;
+    if (sess.customer === true && sess.left > 0) {
+      add(sess.left < 2 * 3600 * 1000 ? 'warn' : 'ok', 'Ingelogd' + (sess.left < 2 * 3600 * 1000 ? ' · sessie verloopt over ' + fmtDuration(sess.left) : ''));
+    } else if (sess.customer === false) {
+      add('bad', 'Anoniem: log in, anders zie je je kooprecht en de vakken niet');
+    } else {
+      add('bad', 'Geen geldige login gevonden: log in');
+    }
+    const q = readQueue();
+    if (q && q.stale) add('warn', 'Je wachtrij-token is verlopen: ververs de pagina (of zet "herstel wachtrij" aan)');
+
+    const ev = state.events.find(e => e.eventId === state.eventId);
+    add(state.eventId != null ? 'ok' : 'bad', state.eventId != null ? (ev ? ev.name : 'Event ' + state.eventId) : 'Nog geen wedstrijd gekozen');
+
+    if (state.eventId != null) {
+      if (!state.sections.length && state.awaySections.length) {
+        add('info', 'Uitwedstrijd: ' + (state.selectedAway.length ? state.selectedAway.length + ' sectie(s) gekozen' : 'eerste vrije sectie') + ' (bus/combi, zoals altijd)');
+      } else if (!state.prefs.length) {
+        add('info', 'Alle vakken (geen voorkeur gekozen)');
+      } else if (state.sections.length && isHomeVenue(state.sections)) {
+        const live = new Map(state.sections.map(x => [x.Name, x]));
+        const missing = state.prefs.filter(n => !live.has(n));
+        add(missing.length === state.prefs.length ? 'bad' : missing.length ? 'warn' : 'ok',
+          state.prefs.join(', ') + (missing.length ? ' · niet bij deze wedstrijd: ' + missing.join(', ') : ''));
+      } else {
+        add('ok', state.prefs.join(', ') + ' · geldt zodra de vakken er zijn');
+      }
+    }
+
+    if (chan.list && chan.list.length > 1) {
+      const names = chan.list.filter(c => channelInScope(c.Id)).map(channelLabel);
+      add('info', 'Zoekt in: ' + names.join(' en ') + ' (thuiswedstrijden)');
+    }
+
+    const r = state.right;
+    const n = state.wantedCount + ' kaart' + (state.wantedCount === 1 ? '' : 'en');
+    if (r && !r.UnlimitedAmount && r.AmountSelectable != null) {
+      add(state.wantedCount <= r.AmountSelectable ? 'ok' : 'bad', n + ' · je mag er ' + r.AmountSelectable + ' kopen');
+    } else if (r && r.UnlimitedAmount) {
+      add('ok', n + ' · geen limiet');
+    } else {
+      add('info', n + ' · kooprecht nog onbekend (komt bij je fase)');
+    }
+
+    const at = state.watch.opensAt;
+    if (state.evRecord && isOnSale(state.evRecord)) add('ok', 'In verkoop');
+    else if (at) add('ok', 'Verkoopstart ' + fmtLocal(at) + ' (' + (state.watch.opensAtIsPersonal ? 'jouw fase' : 'omslag van de knop') + ')');
+    else if (state.eventId != null) add('info', 'Verkoopstart nog onbekend');
+
+    if (ph === 'setup' && ui.go) {
+      const open = state.evRecord && isOnSale(state.evRecord);
+      ui.go.disabled = state.eventId == null;
+      ui.go.textContent = state.eventId == null ? 'Kies eerst een wedstrijd'
+        : (bad ? 'Toch ' : '') + (open ? (bad ? 'starten' : '▶ Start')
+          : (bad ? 'klaarzetten' : '⏳ Klaarzetten') + (at ? ' voor ' + hhmm(at) : ''));
+    }
+  }
+
+  // One card per phase, the same as the TIXX panel: ready (count down to your
+  // phase), searching (the figure that matters), cart (the shop's countdown).
+  // While setting up the checklist says it all; the full status card is
+  // folded away under "Wedstrijdinfo".
+  function renderPhaseCard(ph) {
+    const c = ui.phaseCard;
+    if (!c) return;
+    c.textContent = '';
+    if (ph === 'setup' || !ph) return;
+    const add = (cls, text) => {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.textContent = text;
+      c.appendChild(d);
+      return d;
+    };
+    const ev = state.events.find(e => e.eventId === state.eventId);
+    const title = ev ? ev.name : (state.eventId != null ? 'Wedstrijd ' + state.eventId : '');
+    const next = state.timer && state.nextAt ? 'volgende check over ' + Math.max(0, Math.round((state.nextAt - Date.now()) / 1000)) + ' s' : '';
+    if (ph === 'wait') {
+      add('nts-ph-k', '⏳ Klaar · wacht op de verkoop');
+      add('nts-ph-t', title);
+      const at = state.watch.opensAt;
+      if (at && at.getTime() > Date.now()) {
+        add('nts-ph-big', clock(at.getTime() - Date.now()));
+        add('nts-ph-s', 'start ' + fmtLocal(at) + ' · ' + (state.watch.opensAtIsPersonal ? 'jouw fase' : 'omslag van de knop'));
+      } else {
+        add('nts-ph-s', state.note || 'wacht tot de verkoop voor jou opengaat');
+      }
+      add('nts-ph-s nts-dim', next);
+      return;
+    }
+    if (ph === 'hunt') {
+      add('nts-ph-k', '🔎 Zoekt');
+      add('nts-ph-t', title);
+      const h = state.hunt;
+      add('nts-ph-big', h ? String(h.free) : '…');
+      add('nts-ph-s', (h ? h.unit : 'kijkt in jouw vakken') + (state.freeAll != null ? ' · ' + state.freeAll + ' in het stadion' : ''));
+      if (state.note) add('nts-ph-s', state.note);
+      if (state.quietSince && Date.now() - state.quietSince > QUIET_AFTER_MS) {
+        add('nts-ph-s', 'rustig zoeken: elke ' + QUIET_INTERVAL_MS / 1000 + ' s · al ' + fmtDuration(Date.now() - state.quietSince) + ' niets vrij');
+      }
+      add('nts-ph-s nts-dim', next);
+      return;
+    }
+    add('nts-ph-k', '🎟 In je winkelwagen');
+    add('nts-ph-t', title);
+    for (const p of state.cart.placed) {
+      add('nts-ph-s', (p.col ? p.section.Name + ' · rij ' + p.col.RowNumber + ' stoel ' + p.col.SeatNumber
+        : p.spots + '× ' + p.section.Name) + (p.channelLabel ? ' · ' + p.channelLabel : ''));
+    }
+    // One check-out button per cart: seats can sit in two channels' carts.
+    const carts = [...new Set(state.cart.placed.map(p => p.channel || 0))];
+    const name = id => (id ? (state.cart.placed.find(p => p.channel === id) || {}).channelLabel : 'regulier');
+    ui.pay.textContent = 'Afrekenen' + (carts.length > 1 ? ' ' + name(carts[0]) : '') + ' →';
+    ui.pay.dataset.channel = String(carts[0] || 0);
+    ui.pay2.style.display = carts.length > 1 ? '' : 'none';
+    // Herlaad only works on the page channel's cart.
+    ui.reloadCart.style.display = carts.includes(0) ? '' : 'none';
+    if (carts.length > 1) {
+      ui.pay2.textContent = 'Afrekenen ' + name(carts[1]) + ' →';
+      ui.pay2.dataset.channel = String(carts[1]);
+    }
+    const left = state.cartUntil - Date.now();
+    add('nts-ph-big' + (left < 5 * 60000 ? ' nts-urgent' : ''), mmss(left));
+    add('nts-ph-s', 'om af te rekenen');
+  }
+
+  // Countdown as the TIXX panel shows it: m:ss, h:mm:ss, or days and hours.
+  function clock(ms) {
+    const t = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, sec = t % 60;
+    if (h >= 24) return Math.floor(h / 24) + 'd ' + (h % 24) + 'u';
+    return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0');
+  }
 
   function nameByVbb(vbbId) {
     const s = state.sections.find(x => x.VenueBuildingBlockId === vbbId);
@@ -1445,44 +1933,103 @@
 
   function log(msg) {
     const line = document.createElement('div');
-    line.textContent = msg;
+    line.textContent = nowStr().slice(0, 5) + '  ' + msg;
     ui.log.appendChild(line);
     ui.log.scrollTop = ui.log.scrollHeight;
+    if (ui.lastLog) ui.lastLog.textContent = msg;
   }
 
+  // Home sections as chips, numbered in your order of preference. Before the
+  // match lists any, the home ground as last seen stands in, so you can choose
+  // ahead; the preference is kept by name and applies once sections appear.
   function renderSections() {
-    ui.sections.innerHTML = '';
-    state.sections.forEach(s => {
-      const vbb = s.VenueBuildingBlockId;
-      const idx = state.selectedOrder.indexOf(vbb);
-      const available = s.HasTicketsAvailable === true || s.HasMarketplaceTicketsAvailable === true;
-      const chosen = state.desiredSeats[vbb];
+    ui.sections.textContent = '';
+    ui.sections.classList.add('nts-chipbox');
+    const live = state.sections.length > 0;
+    const list = live
+      ? state.sections.map(x => ({ name: x.Name, stand: x.ParentVenueBuildingBlockName || null }))
+      : ((state.stadium && state.stadium.sections) || []).map(x => (typeof x === 'string' ? { name: x, stand: null } : x));
+    if (!list.length) {
+      const hint = document.createElement('div');
+      hint.className = 'nts-hint';
+      hint.textContent = 'Nog geen vakken. Zodra een thuiswedstrijd vakken toont, onthoud ik het stadion en kun je hier vooraf je vakken kiezen.';
+      ui.sections.appendChild(hint);
+      return;
+    }
+    if (!live) {
+      const note = document.createElement('div');
+      note.className = 'nts-hint';
+      note.textContent = 'Deze wedstrijd toont (nog) geen vakken. Bij een thuiswedstrijd geldt je keuze zodra ze er zijn; uitwedstrijden (bus, combi) hebben geen vakken en gaan zoals altijd.';
+      ui.sections.appendChild(note);
+    }
+    const stands = new Map();
+    for (const it of list) {
+      const k = it.stand || 'Overig';
+      if (!stands.has(k)) stands.set(k, []);
+      stands.get(k).push(it.name);
+    }
+    for (const [stand, names] of stands) {
+      const group = document.createElement('div');
+      const head = document.createElement('div');
+      head.className = 'nts-stand-name';
+      head.textContent = stand;
+      const box = document.createElement('div');
+      box.className = 'nts-chips';
+      names.sort((x, y) => x.localeCompare(y, 'nl', { numeric: true }));
+      names.forEach(name => box.appendChild(sectionChip(name, live)));
+      group.append(head, box);
+      ui.sections.appendChild(group);
+    }
+  }
 
-      const row = document.createElement('div');
-      row.className = 'nts-sec' + (idx >= 0 ? ' nts-sel' : '') + (available ? '' : ' nts-full');
+  function sectionChip(name, live) {
+    const s = live ? state.sections.find(x => x.Name === name) : null;
+    const vbb = s ? s.VenueBuildingBlockId : null;
+    const idx = state.prefs.indexOf(name);
+    const available = s ? (s.HasTicketsAvailable === true || s.HasMarketplaceTicketsAvailable === true) : null;
+    const chosen = vbb != null ? state.desiredSeats[vbb] : null;
 
-      const label = document.createElement('span');
-      label.className = 'nts-sec-label';
-      const badge = idx >= 0 ? (idx + 1) + '. ' : '';
-      const avail = available ? ' · ' + s.AvailableSeats + ' vrij' : ' · vol';
-      const seatBadge = (chosen && chosen.size) ? ' · 🪑' + chosen.size : '';
-      label.textContent = badge + s.Name + avail + seatBadge;
-      label.addEventListener('click', () => toggleSection(vbb));
-
+    const chip = document.createElement('span');
+    chip.className = 'nts-chip' + (idx >= 0 ? ' nts-sel' : '') + (available === false ? ' nts-full' : '');
+    chip.title = name + (s ? (available ? ' · ' + s.AvailableSeats + ' vrij' : ' · vol') : '');
+    if (idx >= 0) {
+      const n = document.createElement('span');
+      n.className = 'nts-chip-n';
+      n.textContent = String(idx + 1);
+      chip.appendChild(n);
+    }
+    const label = document.createElement('span');
+    label.className = 'nts-chip-name';
+    label.textContent = name;
+    chip.appendChild(label);
+    if (available) {
+      const free = document.createElement('span');
+      free.className = 'nts-chip-free';
+      free.textContent = String(s.AvailableSeats);
+      chip.appendChild(free);
+    }
+    if (chosen && chosen.size) {
+      const seats = document.createElement('span');
+      seats.className = 'nts-chip-free';
+      seats.textContent = '🪑' + chosen.size;
+      chip.appendChild(seats);
+    }
+    chip.addEventListener('click', () => toggleSection(name));
+    if (vbb != null) {
       const seatBtn = document.createElement('button');
       seatBtn.className = 'nts-seatbtn';
       seatBtn.textContent = '🪑';
       seatBtn.title = 'Kies specifieke stoelen in dit vak';
       seatBtn.addEventListener('click', (e) => { e.stopPropagation(); openPicker(vbb); });
-
-      row.append(label, seatBtn);
-      ui.sections.appendChild(row);
-    });
+      chip.appendChild(seatBtn);
+    }
+    return chip;
   }
 
   // Away sections are clickable exactly like home sections: click = priority.
   function renderAwaySections(list) {
     ui.sections.innerHTML = '';
+    ui.sections.classList.remove('nts-chipbox');
     list.forEach(a => {
       const vbb = a.VenueBuildingBlockId;
       const idx = state.selectedAway.indexOf(vbb);
@@ -1505,11 +2052,14 @@
     });
   }
 
-  function toggleSection(vbbId) {
-    const i = state.selectedOrder.indexOf(vbbId);
-    if (i >= 0) state.selectedOrder.splice(i, 1);
-    else state.selectedOrder.push(vbbId);
+  function toggleSection(name) {
+    const i = state.prefs.indexOf(name);
+    if (i >= 0) state.prefs.splice(i, 1);
+    else state.prefs.push(name);
+    storeSet(PREFS_KEY, state.prefs);
+    applyPrefs();
     renderSections();
+    render();
   }
 
   // --- Seat picker: show the rows/seats per section and pick specific seats.
@@ -1603,7 +2153,9 @@
               chosen.delete(c.Id);
             } else {
               chosen.add(c.Id);
-              if (!state.selectedOrder.includes(vbbId)) state.selectedOrder.push(vbbId);
+              // Picking seats in a section makes it one of your sections.
+              const nm = nameByVbb(vbbId);
+              if (!state.prefs.includes(nm)) { state.prefs.push(nm); storeSet(PREFS_KEY, state.prefs); applyPrefs(); }
             }
             cell.classList.toggle('nts-seat-chosen');
             updateCount();
@@ -1623,11 +2175,11 @@
     try {
       log('Events laden…');
       state.events = await getEvents();
-      ui.event.innerHTML = '<option value="">— kies event —</option>';
+      ui.event.innerHTML = '<option value="">— kies wedstrijd —</option>';
       state.events.forEach(e => {
         const opt = document.createElement('option');
         opt.value = String(e.eventId);
-        opt.textContent = '[' + e.eventId + '] ' + e.name;
+        opt.textContent = e.name;
         ui.event.appendChild(opt);
       });
       log('✓ ' + state.events.length + ' events geladen.');
@@ -1647,14 +2199,10 @@
         .filter(s => relax || s.SaleCategoryId === state.eventCategory)
         .sort((a, b) => a.Name.localeCompare(b.Name, 'nl', { numeric: true }));
       state.sections = all;
-      if (preserve) {
-        // Keep the chosen priority for sections that still exist.
-        const ids = new Set(all.map(s => s.VenueBuildingBlockId));
-        state.selectedOrder = state.selectedOrder.filter(v => ids.has(v));
-      } else {
-        state.selectedOrder = [];
-        state.desiredSeats = {};
-      }
+      learnStadium(venue.Sections);
+      // Your sections are kept by name, so they carry over to this match.
+      applyPrefs();
+      if (!preserve) state.desiredSeats = {};
       renderSections();
       showEventCard(venue);
       // You do not have to choose what kind of event this is; the sections say.
@@ -1691,7 +2239,8 @@
     const tok = getToken();
     const c = tok && decodeJwt(tok);
     if (!c) {
-      ui.token.textContent = 'token: niet gevonden — log in';
+      ui.token.textContent = 'niet ingelogd';
+      ui.token.title = 'geen token gevonden — log in';
       ui.token.className = 'nts-token nts-bad';
       return;
     }
@@ -1700,7 +2249,8 @@
     const leftTxt = left == null ? '' : ' · ' + (left > 0 ? fmtDuration(left) + ' geldig' : 'VERLOPEN');
     const q = readQueue();
     const qTxt = q ? ' · ' + (q.stale ? '⚠️ rij verlopen' : '🚦 ' + queueWord(q)) : '';
-    ui.token.textContent = (customer ? 'ingelogd' : 'anoniem') + leftTxt + qTxt;
+    ui.token.textContent = customer ? (left > 0 ? 'ingelogd' : 'sessie verlopen') : 'anoniem';
+    ui.token.title = (customer ? 'ingelogd' : 'anoniem') + leftTxt + qTxt;
     ui.token.className = 'nts-token' + (customer && left > 0 ? ' nts-ok' : ' nts-bad');
 
     if (state.session.wasCustomer && !customer) {
@@ -1709,6 +2259,9 @@
       beep();
     }
     state.session.wasCustomer = customer;
+    state.session.customer = customer;
+    state.session.left = left;
+    render();
   }
 
   // Renew well before the 24h expiry. Every 6h is plenty; the shop only ever
@@ -1742,21 +2295,6 @@
     }
   }
 
-  function showBanner(text, label, url) {
-    const href = url || CART_URL;
-    let b = document.getElementById('nts-banner');
-    if (!b) {
-      b = document.createElement('div');
-      b.id = 'nts-banner';
-      document.body.appendChild(b);
-    }
-    b.textContent = (text || '🎟️ Stoel(en) in je winkelwagen!') + ' ';
-    const btn = document.createElement('button');
-    btn.textContent = label || 'Naar winkelwagen →';
-    btn.addEventListener('click', () => { window.location.href = href; });
-    b.appendChild(btn);
-  }
-
   function beep() {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1768,6 +2306,98 @@
       osc.start();
       setTimeout(() => { osc.stop(); ctx.close(); }, 500);
     } catch (e) { /* sound is optional */ }
+  }
+
+  // ------------------------------------------------------------- docking ---
+  // Docked, the panel is a full-height bar on the right and the shop makes
+  // room for it: the page gets a right margin, and the shop's own fixed parts
+  // (header, cookie notice), which are placed against the window and so
+  // ignore that margin, are moved aside — and put back when you undock.
+  // Below DOCK_MIN_SCREEN the shop would get too narrow: then it floats.
+  const DOCK_KEY = 'ntsDock';
+  const DOCK_W = 400;
+  const DOCK_MIN_W = 44;          // folded: a strip with the phase chip
+  const DOCK_MIN_SCREEN = 1100;
+  const dock = { want: true, on: false, observer: null, timer: null, moved: new Map() };
+
+  const dockWidth = () => (ui.panel.classList.contains('nts-min') ? DOCK_MIN_W : DOCK_W);
+
+  function applyDock() {
+    const p = ui.panel;
+    const on = dock.want && window.innerWidth >= DOCK_MIN_SCREEN;
+    restoreFixed();
+    if (on) {
+      p.classList.add('nts-docked');
+      p.style.left = 'auto';
+      p.style.top = '0';
+      p.style.right = '0';
+      p.style.bottom = '0';
+      document.documentElement.style.setProperty('margin-right', dockWidth() + 'px', 'important');
+      if (!dock.on) {
+        dock.observer = new MutationObserver(scheduleFit);
+        dock.observer.observe(document.body, { childList: true, subtree: true });
+        window.addEventListener('scroll', scheduleFit, { passive: true });
+      }
+      dock.on = true;
+      fitFixed();
+    } else {
+      if (dock.on) {
+        dock.observer.disconnect();
+        window.removeEventListener('scroll', scheduleFit);
+      }
+      dock.on = false;
+      p.classList.remove('nts-docked');
+      document.documentElement.style.removeProperty('margin-right');
+      applyPanelPos(readPanelPos());
+    }
+    ui.dockBtn.textContent = dock.want ? '⧉' : '⇥';
+    ui.dockBtn.title = dock.want ? 'Zwevend paneel' : 'Als zijbalk naast de shop';
+  }
+
+  function scheduleFit() {
+    if (dock.timer) return;
+    dock.timer = setTimeout(() => { dock.timer = null; if (dock.on) fitFixed(); }, 400);
+  }
+
+  // Fixed parts of the shop that reach under the bar: full-width ones end at
+  // the bar, right-anchored ones (a cookie notice) move left by its width.
+  // The seat plan (SVG) and the panel itself are skipped, which keeps this
+  // cheap on big pages.
+  function fitFixed() {
+    const w = dockWidth();
+    const edge = window.innerWidth - w;
+    const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+      acceptNode: n => (n === ui.panel || n.namespaceURI === 'http://www.w3.org/2000/svg'
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
+    for (let el = walk.nextNode(); el; el = walk.nextNode()) {
+      if (dock.moved.has(el)) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed') continue;
+      const r = el.getBoundingClientRect();
+      if (!r.width || r.right <= edge + 1) continue;
+      const saved = {};
+      for (const k of ['right', 'width', 'max-width']) saved[k] = [el.style.getPropertyValue(k), el.style.getPropertyPriority(k)];
+      dock.moved.set(el, saved);
+      if (r.left <= 1 && r.width >= window.innerWidth - 2) {
+        el.style.setProperty('right', w + 'px', 'important');
+        el.style.setProperty('width', 'auto', 'important');
+        el.style.setProperty('max-width', edge + 'px', 'important');
+      } else {
+        el.style.setProperty('right', ((parseFloat(cs.right) || 0) + w) + 'px', 'important');
+      }
+    }
+  }
+
+  function restoreFixed() {
+    for (const [el, saved] of dock.moved) {
+      for (const k of Object.keys(saved)) {
+        const [v, prio] = saved[k];
+        if (v) el.style.setProperty(k, v, prio);
+        else el.style.removeProperty(k);
+      }
+    }
+    dock.moved.clear();
   }
 
   // The panel sits over the shop, so let it be moved and remember where. Drag
@@ -1812,6 +2442,7 @@
   function makeDraggable(head) {
     let start = null;
     head.addEventListener('mousedown', (e) => {
+      if (dock.on) return;
       if (e.button !== 0 || e.target.closest('button')) return;   // buttons keep working
       const r = ui.panel.getBoundingClientRect();
       start = { x: e.clientX, y: e.clientY, left: r.left, top: r.top, moved: false };
@@ -1835,12 +2466,12 @@
       start = null;
     });
     head.addEventListener('dblclick', (e) => {
-      if (e.target.closest('button')) return;
+      if (dock.on || e.target.closest('button')) return;
       savePanelPos(null);
       applyPanelPos(null);
       log('↩️ Paneel terug naar de rechteronderhoek.');
     });
-    window.addEventListener('resize', () => applyPanelPos(readPanelPos()));
+    window.addEventListener('resize', () => (dock.want ? applyDock() : applyPanelPos(readPanelPos())));
   }
 
   function buildPanel() {
@@ -1848,23 +2479,44 @@
     panel.id = 'nts-panel';
     // Static markup only: the AMO linter flags any non-literal innerHTML.
     panel.innerHTML =
-      '<div class="nts-head"><span>Seat Assist</span>' +
+      '<div class="nts-head"><span class="nts-title">Seat Assist</span>' +
+      '<span class="nts-phasechip"></span>' +
       '<span class="nts-token nts-bad">token…</span>' +
+      '<button class="nts-dock" title="Zwevend paneel">⧉</button>' +
       '<button class="nts-collapse" title="in-/uitklappen">–</button></div>' +
       '<div class="nts-body">' +
-      '  <div class="nts-row"><button class="nts-events">Events laden</button>' +
-      '    <select class="nts-event"><option value="">— kies event —</option></select></div>' +
-      '  <div class="nts-label">Vakken (klik = prioriteit, 🪑 = kies stoelen): <button class="nts-refresh" title="ververs vakken">↻</button></div>' +
-      '  <div class="nts-sections"></div>' +
-      '  <div class="nts-row nts-countrow"><label>Aantal: <input type="number" class="nts-count" min="1" value="1"></label>' +
-      '    <label title="find-my-seat is niet server-side afgeschermd: reserveren lukt vaak al eerder, afrekenen niet">' +
-      '      <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment</label>' +
-      '    <label title="Ververst de pagina als de wachtrij-token meer dan een minuut verlopen is, zodat de shop hem weer oppakt. Maximaal 3 keer. Houdt je plek NIET warm bij inactiviteit.">' +
-      '      <input type="checkbox" class="nts-requeue"> &#128260; herstel wachtrij</label></div>' +
-      '  <div class="nts-row"><button class="nts-start">▶ Start</button><button class="nts-stop" disabled>■ Stop</button><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button><button class="nts-clear" title="Haalt alle kaarten uit de winkelwagen en laat hem leeg. De kaarten worden vrijgegeven.">🗑 Leeg</button></div>' +
-      '  <div class="nts-watchcard"></div>' +
-      '  <div class="nts-counter">Vrij nu: —</div>' +
-      '  <div class="nts-log"></div>' +
+      '  <div class="nts-phase"></div>' +
+      '  <div class="nts-row nts-cartbar"><button class="nts-start nts-pay">Afrekenen →</button>' +
+      '    <button class="nts-start nts-pay2" style="display:none">Afrekenen →</button>' +
+      '    <button class="nts-clear nts-clear-cart" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Leegmaken</button>' +
+      '    <button class="nts-reload nts-reload-cart" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>' +
+      '  <div class="nts-counter"></div>' +
+      '  <div class="nts-row nts-runbar"><button class="nts-stop">■ Stop</button>' +
+      '    <button class="nts-edit" title="Stopt en gaat terug naar instellen">Wijzigen</button></div>' +
+      '  <div class="nts-check"></div>' +
+      '  <div class="nts-setup">' +
+      '    <div class="nts-h">Wedstrijd</div>' +
+      '    <div class="nts-row"><select class="nts-event"><option value="">— kies wedstrijd —</option></select>' +
+      '      <button class="nts-events nts-icon" title="Wedstrijden laden">↻</button></div>' +
+      '    <div class="nts-h">Vakken <span class="nts-sub">klik in volgorde van voorkeur · 🪑 = kies stoelen · niets = alle</span>' +
+      '      <button class="nts-refresh nts-icon" title="ververs vakken">↻</button></div>' +
+      '    <div class="nts-sections"></div>' +
+      '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label></div>' +
+      '    <details class="nts-more"><summary>Meer opties</summary>' +
+      '      <div class="nts-row nts-kindrow" style="display:none"><label>Soort <select class="nts-kind" title="In welke verkoopkanalen hij zoekt (thuiswedstrijden)">' +
+      '        <option value="all">alles</option><option value="regulier">alleen regulier</option><option value="tweedekans">alleen tweedekans</option>' +
+      '      </select></label></div>' +
+      '      <div class="nts-row"><label title="find-my-seat is niet server-side afgeschermd: reserveren lukt vaak al eerder, afrekenen niet">' +
+      '        <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment reserveren</label></div>' +
+      '      <div class="nts-row"><label title="Ververst de pagina als de wachtrij-token meer dan een minuut verlopen is, zodat de shop hem weer oppakt. Maximaal 3 keer. Houdt je plek NIET warm bij inactiviteit.">' +
+      '        <input type="checkbox" class="nts-requeue"> &#128260; herstel wachtrij</label></div>' +
+      '      <div class="nts-row"><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad winkelwagen</button>' +
+      '        <button class="nts-clear" title="Haalt alle kaarten uit de winkelwagen en laat hem leeg. De kaarten worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
+      '    </details>' +
+      '    <div class="nts-row"><button class="nts-start nts-go">▶ Start</button></div>' +
+      '  </div>' +
+      '  <details class="nts-info"><summary>Wedstrijdinfo</summary><div class="nts-watchcard"></div></details>' +
+      '  <details class="nts-logbox"><summary>Logboek <span class="nts-lastlog"></span></summary><div class="nts-log"></div></details>' +
       '</div>' +
       '<div class="nts-picker"></div>';
     document.body.appendChild(panel);
@@ -1876,15 +2528,21 @@
     ui.count = panel.querySelector('.nts-count');
     ui.early = panel.querySelector('.nts-early');
     ui.requeue = panel.querySelector('.nts-requeue');
-    ui.startBtn = panel.querySelector('.nts-start');
-    ui.stopBtn = panel.querySelector('.nts-stop');
+    ui.go = panel.querySelector('.nts-go');
     ui.reloadBtn = panel.querySelector('.nts-reload');
     ui.clearBtn = panel.querySelector('.nts-clear');
+    ui.check = panel.querySelector('.nts-check');
+    ui.phaseCard = panel.querySelector('.nts-phase');
+    ui.collapse = panel.querySelector('.nts-collapse');
     ui.counter = panel.querySelector('.nts-counter');
     ui.watchCard = panel.querySelector('.nts-watchcard');
     ui.refresh = panel.querySelector('.nts-refresh');
     ui.picker = panel.querySelector('.nts-picker');
     ui.log = panel.querySelector('.nts-log');
+    // The club as in the TIXX panel ("fckoeln"): the shop's own domain name.
+    panel.querySelector('.nts-title').textContent = 'Seat Assist · ' + (location.hostname.split('.').slice(-2)[0] || '');
+    ui.lastLog = panel.querySelector('.nts-lastlog');
+    ui.chip = panel.querySelector('.nts-phasechip');
 
     panel.querySelector('.nts-events').addEventListener('click', loadEvents);
     ui.refresh.addEventListener('click', () => { if (state.eventId != null) loadSections(state.eventId, true); });
@@ -1904,11 +2562,14 @@
       if (changed) { state.awaySections = []; state.prevAway = null; state.selectedAway = []; }
       if (state.eventId != null) loadSections(state.eventId, false);
       else clearEventCard();
+      render();
     });
     ui.count.addEventListener('change', () => {
       const n = parseInt(ui.count.value, 10);
       state.wantedCount = n >= 1 ? n : 1;
       ui.count.value = String(state.wantedCount);
+      try { window.localStorage.setItem(COUNT_KEY, String(state.wantedCount)); } catch (e) { /* not kept */ }
+      render();
     });
     ui.early.addEventListener('change', () => {
       state.tryEarly = ui.early.checked;
@@ -1924,19 +2585,51 @@
         ? '🔄 Aan: bij een vastgelopen wachtrij ververst hij de pagina (max 3×).'
         : '🔄 Uit: hij meldt een vastgelopen wachtrij alleen.');
     });
-    ui.startBtn.addEventListener('click', start);
-    ui.stopBtn.addEventListener('click', stop);
+    ui.go.addEventListener('click', start);
+    panel.querySelector('.nts-stop').addEventListener('click', stop);
+    panel.querySelector('.nts-edit').addEventListener('click', stop);
     ui.reloadBtn.addEventListener('click', reloadCart);
     ui.clearBtn.addEventListener('click', clearCart);
+    ui.kind = panel.querySelector('.nts-kind');
+    try { const k = window.localStorage.getItem(CHANNEL_KEY); if (['all', 'regulier', 'tweedekans'].includes(k)) state.channelKind = k; } catch (e) { /* default */ }
+    ui.kind.value = state.channelKind;
+    ui.kind.addEventListener('change', () => {
+      state.channelKind = ui.kind.value;
+      try { window.localStorage.setItem(CHANNEL_KEY, state.channelKind); } catch (e) { /* not kept */ }
+      render();
+    });
+    loadChannels().then(async list => {
+      if (list.length > 1) panel.querySelector('.nts-kindrow').style.display = '';
+      if (state.cart.done && !state.cartUntil) {
+        await syncCartTime();
+        state.cartSyncAt = Date.now();
+      }
+      render();
+    });
+    ui.pay = panel.querySelector('.nts-pay');
+    ui.pay2 = panel.querySelector('.nts-pay2');
+    ui.reloadCart = panel.querySelector('.nts-reload-cart');
+    ui.pay.addEventListener('click', () => checkout(Number(ui.pay.dataset.channel) || 0));
+    ui.pay2.addEventListener('click', () => checkout(Number(ui.pay2.dataset.channel) || 0));
+    panel.querySelector('.nts-reload-cart').addEventListener('click', reloadCart);
+    panel.querySelector('.nts-clear-cart').addEventListener('click', clearCart);
     panel.querySelector('.nts-collapse').addEventListener('click', (e) => {
       panel.classList.toggle('nts-min');
       e.target.textContent = panel.classList.contains('nts-min') ? '+' : '–';
+      if (dock.on) applyDock();
+    });
+    ui.dockBtn = panel.querySelector('.nts-dock');
+    ui.dockBtn.addEventListener('click', () => {
+      dock.want = !dock.want;
+      try { window.localStorage.setItem(DOCK_KEY, dock.want ? '1' : '0'); } catch (e) { /* not kept */ }
+      applyDock();
     });
 
     const head = panel.querySelector('.nts-head');
     head.title = 'Sleep om te verplaatsen · dubbelklik voor de standaardplek';
     makeDraggable(head);
-    applyPanelPos(readPanelPos());
+    try { dock.want = window.localStorage.getItem(DOCK_KEY) !== '0'; } catch (e) { /* default: docked */ }
+    applyDock();
 
     refreshTokenStatus();
     setInterval(refreshTokenStatus, 3000);
@@ -1950,6 +2643,19 @@
     setInterval(updateCountdown, 1000);
     log('Klaar. Zorg dat je ingelogd bent en door de wachtrij, klik "Events laden".');
     restoreCart();
+    try {
+      const n = parseInt(window.localStorage.getItem(COUNT_KEY), 10);
+      if (n >= 1) { state.wantedCount = n; ui.count.value = String(n); }
+    } catch (e) { /* default 1 */ }
+    Promise.all([storeGet(STADIUM_KEY), storeGet(PREFS_KEY)]).then(([stadium, prefs]) => {
+      state.stadium = stadium && Array.isArray(stadium.sections) ? stadium : null;
+      state.prefs = Array.isArray(prefs) ? prefs : [];
+      applyPrefs();
+      if (!state.awaySections.length) renderSections();
+      render();
+    });
+    // Load the match list right away; it is what you do first anyway.
+    loadEvents().then(render);
   }
 
   buildPanel();

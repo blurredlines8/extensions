@@ -17,8 +17,14 @@
       .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
       .replace(/&quot;/g, '"').replace(/&apos;|&#39;/g, "'")
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+      .replace(/&([A-Za-z]+);/g, (m, n) => NAMED[n] || m)
       .replace(/&amp;/g, '&');
   }
+  // Named entities in German stand names ("Hans Sch&auml;fer S&uuml;dkurve").
+  const NAMED = {
+    auml: 'ä', ouml: 'ö', uuml: 'ü', Auml: 'Ä', Ouml: 'Ö', Uuml: 'Ü', szlig: 'ß',
+    eacute: 'é', egrave: 'è', euml: 'ë', iuml: 'ï', ndash: '–', mdash: '—',
+  };
   // Block names come padded for alignment ("W  3"); show them as "W 3".
   const tidy = s => decodeEntities(s).replace(/\s+/g, ' ').trim();
 

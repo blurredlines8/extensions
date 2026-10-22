@@ -35,6 +35,8 @@
   // reuses it when it is at most CLAIM_VENUE_MS old.
   const AREAS_TTL_MS = 60 * 1000;
   const CLAIM_VENUE_MS = 20 * 1000;
+  // ...and sooner when one of your blocks off that list shows free seats.
+  const RECHECK_MS = 15 * 1000;
   // Every club shares one origin, so keep choices per shop.
   const SETTINGS_KEY = 'satSettings:' + BASE;
   const RUNNING_KEY = 'satRunning:' + BASE;
@@ -51,6 +53,18 @@
   const EVENTS_POLL_NEAR_MS = 30 * 1000;
   const NEAR_SALE_MS = 15 * 60 * 1000;
   const SCHEDULE_REFRESH_MS = 30 * 60 * 1000;
+  // Shared by every tab and Firefox container (extension storage, not the
+  // page's): the club's stadium as last seen, and your blocks by name. Block
+  // ids differ per match, names and rows do not (Köln, two matches, 56 of 56).
+  const STADIUM_KEY = 'tixx:stadium:' + CLUB;
+  const PREFS_KEY = 'tixx:blocks:' + CLUB;
+  // The cart holds seats for 20 minutes; the shop tells the exact rest.
+  const CART_HOLD_MS = 20 * 60 * 1000;
+  // The cart phase survives a page load in this tab (e.g. "Afrekenen" opens
+  // the cart page): what is in the cart, and until when.
+  const CART_KEY = 'satCart:' + BASE;
+
+  const ext = typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null);
 
   const state = {
     events: [],
@@ -77,7 +91,16 @@
     groupLogged: new Set(),
     free: new Set(),       // free seat ids from the latest availability
     ga: new Map(),         // standing-area id -> free amount
-    selected: [],          // block ids in priority order (click order)
+    selected: [],          // block ids in priority order, from `prefs` for this match
+    prefs: [],             // your blocks by name, in priority order (per club)
+    stadium: null,         // { blocks: [{ name, stand, ga }], at } as last seen
+    foreignVenue: false,   // this match's plan is another stadium (an away match)
+    saleAt: null,          // when the sale starts, if known (queue, table, own time)
+    statusText: '',
+    freeMine: null,        // free seats in your blocks at the last look
+    lastTry: '',           // the last attempt, in words
+    cartSeats: [],         // names of the seats this run put in the cart
+    cartUntil: 0,          // when the cart's hold runs out (0 = no cart phase)
     want: 1,
     mode: 'row',           // row | cluster | loose
     geo: null,             // seat positions and row directions per block
@@ -130,8 +153,8 @@
     return res;
   }
 
-  async function apiGet(kind, suffix, extra) {
-    const sm = state.venue && state.venue.seatmap;
+  async function apiGet(kind, suffix, extra, venue) {
+    const sm = (venue || state.venue) && (venue || state.venue).seatmap;
     if (!sm) throw new Error('geen stoelplan-parameters');
     const q = new URLSearchParams(Object.assign({}, extra || {}, sm.params));
     const res = await pageFetch(API + '/seatmap/api/public/' + kind + '/' + sm.key + (suffix || '') + '?' + q, {
@@ -139,7 +162,7 @@
       headers: { Accept: 'application/json' },
     });
     if (res.status === 401 || res.status === 403) {
-      state.venueAt = 0;   // signature expired: fetch the venue page again
+      if (!venue) state.venueAt = 0;   // signature expired: fetch the venue page again
       throw new Error('stoelplan-API weigert (' + res.status + '), handtekening wordt ververst');
     }
     if (res.status === 304) return null;   // unchanged since the timestamp we sent
@@ -166,7 +189,92 @@
     const sm = await apiGet('seatmap', '', { generateTiles: 'false' });
     state.blocks = core.blocksFromSeatmap(sm);
     state.geo = core.seatGeometry(sm);
+    await learnStadium(state.blocks, state.venue);
+    applyPrefs();
     renderBlocks();
+  }
+
+  // ------------------------------------------------------------- stadium ---
+  async function storeGet(key) {
+    try {
+      if (!ext || !ext.storage || !ext.storage.local) return null;
+      const r = await ext.storage.local.get(key);
+      return r ? r[key] : null;
+    } catch (e) { return null; }
+  }
+  async function storeSet(key, value) {
+    try { if (ext && ext.storage && ext.storage.local) await ext.storage.local.set({ [key]: value }); } catch (e) { /* not kept */ }
+  }
+
+  // Remember the stadium from a plan: block names (rows and seats per block do
+  // not change between matches), each with its stand from the venue page's
+  // areaList, or else the stand of blocks with the same letter ("N 5" → Nord).
+  // A plan that shares too little with what we know is another stadium: an
+  // away match. That one is used as it is but not remembered.
+  async function learnStadium(blocks, venue) {
+    if (!blocks.length) return;
+    const prefix = n => (/^([^\d\s]+)/.exec(n) || ['', ''])[1];
+    const byPrefix = new Map();
+    const standById = new Map();
+    for (const a of (venue && venue.areas) || []) {
+      for (const b of a.blocks) {
+        standById.set(b.id, a.name);
+        if (prefix(b.name)) byPrefix.set(prefix(b.name), a.name);
+      }
+    }
+    const old = state.stadium;
+    const oldStand = new Map(((old && old.blocks) || []).map(b => [b.name, b.stand]));
+    if (old && old.blocks.length) {
+      const known = new Set(old.blocks.map(b => b.name));
+      const shared = blocks.filter(b => known.has(b.name)).length;
+      state.foreignVenue = shared < Math.min(blocks.length, known.size) / 2;
+      if (state.foreignVenue) { log('🏟 Dit stoelplan hoort bij een ander stadion; je vakvoorkeur geldt hier niet.'); return; }
+    } else {
+      state.foreignVenue = false;
+    }
+    const next = blocks.map(b => ({
+      name: b.name,
+      stand: standById.get(b.id) || oldStand.get(b.name) || byPrefix.get(prefix(b.name)) || null,
+      ga: !!b.ga,
+    }));
+    const changed = !old || old.blocks.length !== next.length || next.some(b => oldStand.get(b.name) !== b.stand);
+    state.stadium = { blocks: next, at: Date.now() };
+    if (changed) {
+      await storeSet(STADIUM_KEY, state.stadium);
+      log('🏟 Stadion onthouden: ' + next.length + ' vakken. Je vakvoorkeur geldt voortaan voor elke thuiswedstrijd.');
+    }
+  }
+
+  // Your blocks by name → this match's block ids.
+  function applyPrefs() {
+    if (!state.blocks.length || state.foreignVenue) { state.selected = []; return; }
+    const id = new Map(state.blocks.map(b => [b.name, b.id]));
+    state.selected = state.prefs.map(n => id.get(n)).filter(x => x != null);
+  }
+
+  function savePrefs() {
+    storeSet(PREFS_KEY, state.prefs);
+    applyPrefs();
+  }
+
+  // No stadium known yet: learn it from any match whose plan is open now
+  // (often there is one, e.g. on resale), without changing the chosen match.
+  async function learnFromOpenMatch() {
+    try {
+      const list = state.events.length ? state.events : (state.events = await fetchEvents());
+      fillEvents();
+      const open = list.filter(e => e.open).sort((a, b) => (b.id === state.eventId) - (a.id === state.eventId));
+      for (const e of open) {
+        const v = core.parseVenuePage(await (await shopFetch(venuePath(e.id))).text());
+        if (!v.seatmap) continue;
+        const sm = await apiGet('seatmap', '', { generateTiles: 'false' }, v);
+        await learnStadium(core.blocksFromSeatmap(sm), v);
+        renderBlocks();
+        render();
+        return;
+      }
+      log('🏟 Nu staat geen wedstrijd met een stoelplan open; het stadion leer ik zodra er een is.');
+    } catch (e) { onError(e); }
   }
 
   // The plain URL is served from a cache and can be an hour old (HAR
@@ -233,13 +341,16 @@
     const need = state.want - state.acquired;
     const limits = state.venue && state.venue.limits;
     const sale = core.saleBlocks(state.venue);
-    const order = state.selected.length ? state.selected : state.blocks.map(b => b.id);
+    // With a preference only those blocks, even if none is in this plan; only
+    // on another stadium (away) or without a preference: every block.
+    const usePrefs = state.prefs.length && !state.foreignVenue;
+    const order = usePrefs ? state.selected : state.blocks.map(b => b.id);
     return order.filter(b => {
       if (sale && !sale.has(b)) {
         // Not "logged once": a sold-out block leaves the list and may return.
         if (!state.limitLogged.has('sale:' + b) && state.selected.includes(b)) {
           state.limitLogged.add('sale:' + b);
-          log('🚫 ' + blockName(b) + ' wordt nu niet via deze shop verkocht (of is uitverkocht); overgeslagen.');
+          log('⏸ ' + blockName(b) + ' is nu niet te koop; ik blijf het bewaken (bijv. voor de Ticketbörse).');
         }
         return false;
       }
@@ -288,7 +399,7 @@
     if (!state.group) return Promise.resolve(null);
     return groupSend('update', {
       eventId: state.eventId, want: state.want, cart: state.cart || [],
-      config: { eventId: state.eventId, eventLabel: state.eventLabel, eventDate: state.eventDate, selected: state.selected, kind: state.kind },
+      config: { eventId: state.eventId, eventLabel: state.eventLabel, eventDate: state.eventDate, prefs: state.prefs, kind: state.kind },
     });
   }
 
@@ -298,18 +409,8 @@
     log(msg);
   }
 
-  function renderGroup() {
-    const v = state.groupView;
-    if (!ui.groupInfo) return;
-    if (!state.group || !v) { ui.groupInfo.textContent = ''; return; }
-    const same = v.members.filter(m => m.same);
-    const other = v.members.length - same.length;
-    const held = same.reduce((a, m) => a + m.cart, 0);
-    const me = v.members.find(m => m.me);
-    ui.groupInfo.textContent = same.length + ' account' + (same.length === 1 ? '' : 's') + ' · ' +
-      same.map(m => m.want).join('+') + ' = ' + v.total + ' kaarten · vast: ' + held +
-      (me ? ' · dit is #' + me.n : '') + (other ? ' · ⚠ ' + other + ' op een andere wedstrijd' : '');
-  }
+  // The group's line lives in the checklist.
+  const renderGroup = () => render();
 
   // Joining a group without a match chosen: take the match and blocks another
   // member set up, so each container need not be configured by hand.
@@ -322,7 +423,7 @@
     state.eventId = Number(c.eventId);
     state.eventLabel = c.eventLabel || null;
     state.eventDate = c.eventDate || null;
-    state.selected = Array.isArray(c.selected) ? c.selected.map(Number) : [];
+    if (Array.isArray(c.prefs) && c.prefs.length && !state.prefs.length) { state.prefs = c.prefs.slice(); savePrefs(); }
     if (['all', 'sale', 'resale'].includes(c.kind)) { state.kind = c.kind; ui.kind.value = c.kind; }
     saveSettings();
     fillEvents();
@@ -434,7 +535,10 @@
     const landed = chosen.filter(id => items.some(it => it.seatId === id));
     if (items.length) state.cart = items.filter(it => Number(it.eventId) === ev).map(it => it.seatId);
     ids.forEach(id => state.attempted.add(id));
-    if (landed.length) log('🛒 In winkelwagen: ' + landed.map(seatName).join(', '));
+    if (landed.length) {
+      state.cartSeats = state.cartSeats.concat(landed.map(seatName));
+      log('🛒 In winkelwagen: ' + landed.map(seatName).join(', '));
+    }
     else log('✗ Naar de winkelwagen mislukt (' + res.status + ', ' + new URL(res.url).pathname.split('/').pop() + ')');
     return landed.length;
   }
@@ -463,6 +567,8 @@
       const left = core.parseCart(await (await shopFetch('/shoppingcart')).text());
       log(left.length ? '⚠️ Nog ' + left.length + ' kaart(en) in de winkelwagen.' : '🗑 Winkelwagen leeg (' + items.length + ' vrijgegeven).');
       state.acquired = 0;
+      if (!left.length) { state.cartUntil = 0; state.cartSeats = []; state.cart = []; saveCartPhase(); }
+      render();
     } catch (e) { onError(e); }
   }
 
@@ -520,6 +626,14 @@
 
       const av = await fetchAvailability();
       delay = Math.max(MIN_REFRESH_MS, av.expiresIn > 0 ? av.expiresIn + 5000 : DEFAULT_REFRESH_MS);
+      // A block of yours not on the sale list (sold out) that shows free seats
+      // again — e.g. a resale ticket: look at the sale list now instead of at
+      // the next minute, so it can be bought right away.
+      const sale = core.saleBlocks(state.venue);
+      if (sale && Date.now() - state.venueAt > RECHECK_MS) {
+        const freeBlocks = new Set([...state.free].map(core.blockOf));
+        if (state.selected.some(b => !sale.has(b) && freeBlocks.has(b))) await loadVenue(state.eventId);
+      }
       const scope = new Set(eligibleBlocks());
       const inScope = id => scope.has(core.blockOf(id));
       const candidates = [...state.free].filter(inScope);
@@ -537,8 +651,10 @@
         if (ids.length) {
           for (const b of new Set(ids.map(core.blockOf))) await getLabels(b);
           log('🎯 ' + nowStr() + ' probeer ' + ids.map(seatName).join(', '));
+          const before = state.acquired;
           try {
             state.acquired += await claim(ids);
+            state.lastTry = nowStr().slice(0, 5) + ' ' + ids.map(seatName).join(', ') + (state.acquired > before ? ' ✓' : ' ✗');
           } finally {
             if (state.group) { await groupSend('release'); await groupSync(); }
           }
@@ -595,6 +711,7 @@
   // like any visitor (a page load does that), and Queue-it sends it back to
   // the shop afterwards, where a running search resumes. Otherwise it only says so.
   function onQueue(q) {
+    if (q.startAt) state.saleAt = q.startAt;
     const when = q.startAt ? new Date(q.startAt).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }) : null;
     const what = q.before
       ? 'Voorwachtrij' + (q.name ? ' voor ' + q.name : '') + (when ? ', start ' + when : '') +
@@ -637,13 +754,16 @@
     state.attempted = new Set();
     state.cart = null;     // checked on the first round: what is held counts against the limit
     state.waitLogged = false;
+    state.cartSeats = [];
+    state.cartUntil = 0;
+    state.lastTry = '';
     state.gaLogged = new Set();
     saveRunning(true);
     setRunning(true);
     warnLogin();
-    const names = state.selected.length
-      ? state.selected.map((b, i) => (i + 1) + '. ' + blockName(b)).join('  ')
-      : 'alle blokken';
+    const names = state.prefs.length && !state.foreignVenue
+      ? state.prefs.map((n, i) => (i + 1) + '. ' + n).join('  ')
+      : 'alle vakken';
     const kind = { all: 'alles', sale: 'alleen verkoop', resale: 'alleen Ticketbörse' }[state.kind];
     state.limitLogged = new Set();
     state.groupLogged = new Set();
@@ -658,21 +778,66 @@
     saveRunning(false);
     setRunning(false);
     restoreTitle();
+    render();
   }
 
   function onSuccess() {
+    state.cartUntil = Date.now() + CART_HOLD_MS;
+    saveCartPhase();
     stop();
     log('🎟️ ' + state.acquired + ' plaats(en) in je winkelwagen. Je hebt 20 minuten om af te rekenen!');
-    showBanner('🎟️ ' + state.acquired + ' plaats(en) in je winkelwagen!', 'Naar winkelwagen →', SHOP + '/shoppingcart');
+    ui.panel.classList.remove('sat-min');
+    ui.panel.querySelector('.sat-collapse').textContent = '–';
+    if (dock.on) applyDock();
     flashTitle('🎟️');
     beep();
+    syncCartTime();
+  }
+
+  function saveCartPhase() {
+    try {
+      if (state.cartUntil > Date.now()) {
+        window.sessionStorage.setItem(CART_KEY, JSON.stringify({ eventId: state.eventId, until: state.cartUntil, seats: state.cartSeats }));
+      } else {
+        window.sessionStorage.removeItem(CART_KEY);
+      }
+    } catch (e) { /* not kept */ }
+  }
+
+  // After a page load: back to the cart phase if there was one, then let the
+  // shop's clock confirm it (an empty or expired cart ends it).
+  function restoreCartPhase() {
+    try {
+      const c = JSON.parse(window.sessionStorage.getItem(CART_KEY) || 'null');
+      if (!c || !(c.until > Date.now())) return;
+      if (state.eventId == null) state.eventId = c.eventId;
+      state.cartUntil = c.until;
+      state.cartSeats = Array.isArray(c.seats) ? c.seats : [];
+      syncCartTime();
+    } catch (e) { /* none */ }
+  }
+
+  // The shop's own countdown: POST shoppingcart/timeout → remaining min/sek.
+  async function syncCartTime() {
+    try {
+      const res = await shopFetch('/shoppingcart/timeout', {
+        method: 'POST',
+        headers: { 'Content-Type': FORM, 'X-Requested-With': 'XMLHttpRequest' },
+        body: 'setErrorMessage=false',
+      });
+      const j = await res.json();
+      const r = j && j.remaining;
+      if (r) state.cartUntil = Date.now() + (Number(r.min) * 60 + Number(r.sek)) * 1000;
+    } catch (e) { /* keep the local estimate */ }
+    saveCartPhase();
+    render();
   }
 
   // ------------------------------------------------------------- settings ---
   function saveSettings() {
     try {
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({
-        eventId: state.eventId, eventLabel: state.eventLabel, eventDate: state.eventDate, selected: state.selected,
+        eventId: state.eventId, eventLabel: state.eventLabel, eventDate: state.eventDate,
         want: state.want, mode: state.mode, kind: state.kind, armTime: state.armTime, armMatch: state.armMatch,
         group: state.group,
       }));
@@ -696,13 +861,24 @@
   }
 
   // ------------------------------------------------------------------- UI ---
+  // The panel follows the phase you are in: setting up, ready and waiting for
+  // the sale, searching, or seats in the cart. Each phase shows only what
+  // matters then; a checklist keeps warnings in view instead of in the log.
   const ui = {};
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
 
   function log(msg) {
     const line = document.createElement('div');
-    line.textContent = msg;
+    line.textContent = nowStr().slice(0, 5) + '  ' + msg;
     ui.log.appendChild(line);
     ui.log.scrollTop = ui.log.scrollHeight;
+    ui.lastLog.textContent = msg;
   }
 
   function setLogin(on) {
@@ -712,6 +888,7 @@
     ui.token.className = 'sat-token ' + (on ? 'sat-ok' : 'sat-bad');
     if (on) state.loginWarned = false;
     else warnLogin();
+    render();
   }
 
   // Logged out, the shop lists only matches on free sale (1 of 5 in the HAR of
@@ -722,38 +899,22 @@
     if (state.loggedIn !== false || !armed || state.loginWarned) return;
     state.loginWarned = true;
     log('🔑 Je bent niet ingelogd. Zonder login zie je de ledenverkoop niet — log in vóór de wachtrij.');
-    showBanner('🔑 Niet ingelogd: de ledenverkoop zie je pas na inloggen.', 'Inloggen',
-      SHOP + '/oauth/start?target_uri=' + encodeURIComponent(window.location.href));
+    showBanner('🔑 Niet ingelogd: de ledenverkoop zie je pas na inloggen.', 'Inloggen', loginUrl());
     beep();
   }
 
-  function setRunning(on) {
-    ui.startBtn.disabled = on;
-    ui.stopBtn.disabled = !on;
-  }
+  const loginUrl = () => SHOP + '/oauth/start?target_uri=' + encodeURIComponent(window.location.href);
+
+  function setRunning() { render(); }
 
   function setStatus(text) {
-    ui.status.textContent = '';
-    const t = document.createElement('div');
-    t.className = 'sat-wc-title';
-    t.textContent = state.eventLabel || ('Event ' + state.eventId);
-    const s = document.createElement('div');
-    s.className = 'sat-wc-m';
-    s.textContent = text + ' · ' + nowStr();
-    ui.status.append(t, s);
-    const sale = state.eventDate && saleInfoFor(state.eventDate);
-    if (sale) {
-      const v = document.createElement('div');
-      v.className = 'sat-wc-pl';
-      v.textContent = 'Verkoop: ' + sale;
-      ui.status.appendChild(v);
-    }
+    state.statusText = text;
+    render();
   }
 
   function setCounter(n) {
-    const total = state.free.size;
-    ui.counter.textContent = 'Vrij nu: ' + n + (state.selected.length ? ' in jouw blokken' : '') + ' · ' + total + ' in het hele stadion';
-    ui.counter.classList.toggle('sat-idle', n === 0);
+    state.freeMine = n;
+    render();
   }
 
   function freeIn(blockId) {
@@ -762,40 +923,253 @@
     return n + (state.ga.get(blockId * 1e6) || 0);
   }
 
-  function renderBlocks() {
-    ui.blocks.textContent = '';
-    if (!state.blocks.length) {
-      const hint = document.createElement('div');
-      hint.className = 'sat-hint';
-      hint.textContent = state.selected.length
-        ? 'Gekozen: ' + state.selected.map((b, i) => (i + 1) + '. ' + blockName(b)).join('  ') + ' (↻ om alle blokken te laden)'
-        : 'Kies een wedstrijd en klik ↻ om de blokken te laden.';
-      ui.blocks.appendChild(hint);
+  function phase() {
+    if (state.cartUntil > Date.now()) return 'cart';
+    if (state.running) return state.venue && state.venue.seatmap ? 'hunt' : 'wait';
+    return 'setup';
+  }
+
+  // When the sale starts, if anything tells us: the queue page, your own
+  // time, or the club's presale table.
+  function saleStart() {
+    if (state.saleAt) return { at: state.saleAt, from: 'wachtrij' };
+    const own = armAt();
+    if (own != null) return { at: own, from: 'zelf ingesteld' };
+    const r = state.eventDate && state.schedule.find(x => x.date === state.eventDate);
+    if (r) {
+      const next = [r.members, r.general].filter(Boolean).map(x => x.at).filter(t => t > Date.now() - 3600000).sort((a, b) => a - b)[0];
+      if (next) return { at: next, from: 'verkooptabel' };
+    }
+    return null;
+  }
+
+  const pad = n => String(n).padStart(2, '0');
+  const fmtClock = ms => { const d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  function fmtCountdown(ms) {
+    const t = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, sec = t % 60;
+    if (h >= 24) return Math.floor(h / 24) + 'd ' + (h % 24) + 'u';
+    return (h ? h + ':' + pad(m) : String(m)) + ':' + pad(sec);
+  }
+  function nextCheckText() {
+    if (!state.running || !state.timer) return '';
+    return 'volgende check over ' + Math.max(0, Math.round((state.nextAt - Date.now()) / 1000)) + ' s';
+  }
+  const matchTitle = () => state.eventLabel || (state.eventId != null ? 'Wedstrijd ' + state.eventId : null);
+
+  function render() {
+    if (!ui.panel) return;
+    const ph = phase();
+    ui.panel.setAttribute('data-phase', ph);
+    renderPhase(ph);
+    renderChip(ph);
+    renderCheck(ph);
+  }
+
+  function renderPhase(ph) {
+    const c = ui.phase;
+    c.textContent = '';
+    const now = Date.now();
+    const title = matchTitle();
+    if (ph === 'setup') {
+      c.append(el('div', 'sat-ph-k', 'Instellen'), el('div', 'sat-ph-t', title || 'Kies een wedstrijd'));
       return;
     }
-    for (const b of state.blocks) {
-      const idx = state.selected.indexOf(b.id);
-      const n = freeIn(b.id);
-      const row = document.createElement('div');
-      row.className = 'sat-sec' + (idx >= 0 ? ' sat-sel' : '') + (n ? '' : ' sat-full') + (b.ga ? ' sat-ga' : '');
-      const label = document.createElement('span');
-      label.className = 'sat-sec-label';
-      label.textContent = (idx >= 0 ? (idx + 1) + '. ' : '') + b.name + (b.ga ? ' (staan)' : '');
-      const count = document.createElement('span');
-      count.className = 'sat-sec-free';
-      count.textContent = n ? n + ' vrij' : '';
-      row.append(label, count);
-      row.addEventListener('click', () => toggleBlock(b.id));
-      ui.blocks.appendChild(row);
+    if (ph === 'wait') {
+      const st = saleStart();
+      c.append(el('div', 'sat-ph-k', '⏳ Klaar · wacht op de verkoop'), el('div', 'sat-ph-t', title));
+      if (st && st.at > now) {
+        c.append(el('div', 'sat-ph-big', fmtCountdown(st.at - now)), el('div', 'sat-ph-s', 'start ' + fmtClock(st.at) + ' · ' + st.from));
+      } else {
+        c.append(el('div', 'sat-ph-s', (st ? 'de verkoop zou open moeten zijn' : 'starttijd onbekend') +
+          ' · kijkt ' + (nearArm() ? 'elke 5 s' : 'elke minuut') + ' of het stoelplan er is'));
+      }
+      c.append(el('div', 'sat-ph-s sat-dim', nextCheckText()));
+      return;
+    }
+    if (ph === 'hunt') {
+      c.append(el('div', 'sat-ph-k', '🔎 Zoekt'), el('div', 'sat-ph-t', title));
+      c.append(el('div', 'sat-ph-big', state.freeMine == null ? '…' : String(state.freeMine)),
+        el('div', 'sat-ph-s', 'vrij in ' + (state.selected.length ? 'jouw vakken' : 'alle vakken') + ' · ' + state.free.size + ' in het stadion'));
+      if (state.lastTry) c.append(el('div', 'sat-ph-s', 'laatste poging ' + state.lastTry));
+      c.append(el('div', 'sat-ph-s sat-dim', nextCheckText()));
+      return;
+    }
+    const left = state.cartUntil - now;
+    c.append(el('div', 'sat-ph-k', '🎟 In je winkelwagen'), el('div', 'sat-ph-t', title));
+    for (const n of state.cartSeats) c.append(el('div', 'sat-ph-s', n));
+    c.append(el('div', 'sat-ph-big' + (left < 5 * 60000 ? ' sat-urgent' : ''), fmtCountdown(left)), el('div', 'sat-ph-s', 'om af te rekenen'));
+  }
+
+  function renderChip(ph) {
+    const now = Date.now();
+    const st = saleStart();
+    ui.chip.textContent =
+      ph === 'wait' ? '⏳ ' + (st && st.at > now ? fmtCountdown(st.at - now) : 'klaar')
+        : ph === 'hunt' ? '🔎 ' + (state.freeMine == null ? '…' : state.freeMine) + ' vrij'
+          : ph === 'cart' ? '🎟 ' + fmtCountdown(state.cartUntil - now) : '';
+  }
+
+  // What is set up, and what is not. A red line turns the main button into
+  // "Toch …": it still goes, but you have been told.
+  function renderCheck(ph) {
+    const c = ui.check;
+    c.textContent = '';
+    let bad = 0;
+    const add = (status, text, btn) => {
+      if (status === 'bad') bad++;
+      const row = el('div', 'sat-ck sat-ck-' + status);
+      row.append(el('span', 'sat-ck-i', { ok: '✓', warn: '!', bad: '✗', info: '•' }[status]), el('span', 'sat-ck-t', text));
+      if (btn) {
+        const b = el('button', 'sat-ck-b', btn.label);
+        b.type = 'button';
+        b.addEventListener('click', btn.on);
+        row.appendChild(b);
+      }
+      c.appendChild(row);
+    };
+    if (state.loggedIn === true) add('ok', 'Ingelogd');
+    else if (state.loggedIn === false) add('bad', 'Niet ingelogd: zonder login zie je de ledenverkoop niet', { label: 'Inloggen', on: () => { window.location.href = loginUrl(); } });
+    else add('info', 'Inlogstatus nog onbekend');
+
+    add(state.eventId != null ? 'ok' : 'bad', state.eventId != null ? matchTitle() : 'Nog geen wedstrijd gekozen');
+
+    if (state.foreignVenue) {
+      add('info', 'Ander stadion (uitwedstrijd): je vakvoorkeur geldt hier niet, alle vakken tellen');
+    } else if (!state.stadium && !state.blocks.length) {
+      add('warn', 'Stadion nog onbekend: vakken kiezen kan zodra het één keer gezien is', { label: 'Stadion leren', on: learnFromOpenMatch });
+    } else if (!state.prefs.length) {
+      add('info', 'Alle vakken (geen voorkeur gekozen)');
+    } else {
+      const sale = state.blocks.length ? core.saleBlocks(state.venue) : null;
+      const ids = new Map(state.blocks.map(b => [b.name, b.id]));
+      const off = sale ? state.prefs.filter(n => !ids.has(n) || !sale.has(ids.get(n))) : [];
+      const on = state.prefs.filter(n => !off.includes(n));
+      if (!off.length) add('ok', state.prefs.join(', '));
+      else if (on.length) add('ok', on.join(', ') + ' · ' + off.join(', ') + ' nu niet te koop, ik blijf ze bewaken');
+      else add('warn', 'Nu is geen van je vakken te koop (' + off.join(', ') + '); ik blijf ze bewaken');
+    }
+
+    const limits = state.venue && state.venue.limits;
+    const held = state.cart ? state.cart.length : 0;
+    const n = state.want + ' kaart' + (state.want === 1 ? '' : 'en');
+    if (limits && limits.maxTotal) {
+      add(state.want <= limits.maxTotal - held ? 'ok' : 'bad', n + ' · de shop staat max ' + limits.maxTotal + ' toe' + (held ? ' (' + held + ' al in je winkelwagen)' : ''));
+    } else {
+      add('info', n + ' · de limiet zie je zodra het stoelplan er is');
+    }
+
+    const st = saleStart();
+    if (st) add('ok', 'Verkoopstart ' + fmtClock(st.at) + ' (' + st.from + ')');
+    else add('info', 'Verkoopstart onbekend: vul hem in, dan kijkt hij rond de start elke 5 s');
+
+    if (state.group) {
+      const v = state.groupView;
+      if (!v) add('warn', 'Groep: nog geen contact met de andere tabbladen');
+      else {
+        const same = v.members.filter(m => m.same);
+        const other = v.members.length - same.length;
+        add(other ? 'warn' : same.length > 1 ? 'ok' : 'info', 'Groep: ' + same.length + ' account' + (same.length === 1 ? '' : 's') +
+          ' · ' + same.map(m => m.want).join('+') + ' = ' + v.total + ' kaarten' +
+          (other ? ' · ' + other + ' op een andere wedstrijd' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''));
+      }
+    }
+
+    if (ph === 'setup') {
+      const open = state.venue && state.venue.seatmap;
+      ui.go.disabled = state.eventId == null;
+      ui.go.textContent = state.eventId == null ? 'Kies eerst een wedstrijd'
+        : (bad ? 'Toch ' : '') + (open ? (bad ? 'starten' : '▶ Start') : (bad ? 'klaarzetten' : '⏳ Klaarzetten') + (st && st.at > Date.now() ? ' voor ' + fmtClock(st.at) : ''));
     }
   }
 
-  function toggleBlock(id) {
-    const i = state.selected.indexOf(id);
-    if (i >= 0) state.selected.splice(i, 1);
-    else state.selected.push(id);
-    saveSettings();
+  // The blocks to show: this match's plan when it is there, else the stadium
+  // as last seen. Per block what we know right now: free seats, whether this
+  // shop sells it, a lower ticket cap, resale.
+  function blockItems() {
+    const fromPlan = state.blocks.length && !state.foreignVenue;
+    const sale = core.saleBlocks(state.venue);
+    const limits = state.venue && state.venue.limits;
+    const areas = (state.venue && state.venue.areas) || [];
+    const resale = new Set(areas.flatMap(a => a.blocks.filter(b => b.resale).map(b => b.id)));
+    const known = new Map(((state.stadium && state.stadium.blocks) || []).map(b => [b.name, b.stand]));
+    const src = fromPlan
+      ? state.blocks.map(b => ({ name: b.name, id: b.id, ga: !!b.ga }))
+      : ((state.stadium && state.stadium.blocks) || []).map(b => ({ name: b.name, id: null, ga: b.ga }));
+    const lowCap = limits && limits.maxMarked && limits.maxMarked < (limits.maxTotal || Infinity);
+    // A stand learned from a sale list that only had some stands: blocks of
+    // the other stands then share their letter ("O 3" with "O 12"), so group
+    // them under that letter rather than one big "Overig".
+    const letter = n => (/^([^\d\s]+)/.exec(n) || ['', ''])[1];
+    const byLetter = new Map();
+    for (const b of src) {
+      const st = (b.id != null && core.standOf(areas, b.id)) || known.get(b.name);
+      if (st && letter(b.name)) byLetter.set(letter(b.name), st);
+    }
+    const standFor = b => (b.id != null && core.standOf(areas, b.id)) || known.get(b.name) ||
+      byLetter.get(letter(b.name)) || (letter(b.name) ? 'Vakken ' + letter(b.name) : 'Overig');
+    return src.map(b => ({
+      name: b.name,
+      id: b.id,
+      ga: b.ga,
+      stand: standFor(b),
+      free: b.id != null && state.av ? freeIn(b.id) : null,
+      sale: b.id != null && sale ? sale.has(b.id) : null,
+      cap: b.id != null && lowCap && limits.marked.has(b.id) ? limits.maxMarked : null,
+      resale: b.id != null && resale.has(b.id),
+    }));
+  }
+
+  function renderBlocks() {
+    ui.blocks.textContent = '';
+    const items = blockItems();
+    if (!items.length) {
+      ui.blocks.appendChild(el('div', 'sat-hint', 'Het stadion is nog onbekend. Zodra er ergens een stoelplan open is, verschijnen de vakken hier (of klik hierboven "Stadion leren").'));
+      render();
+      return;
+    }
+    if (items.some(it => it.sale === false)) {
+      ui.blocks.appendChild(el('div', 'sat-legend', 'Grijs = nu niet te koop. Kies ze gerust: ze worden bewaakt (bijv. voor de Ticketbörse).'));
+    }
+    const stands = new Map();
+    for (const it of items) {
+      if (!stands.has(it.stand)) stands.set(it.stand, []);
+      stands.get(it.stand).push(it);
+    }
+    for (const [stand, list] of stands) {
+      const box = el('div', 'sat-stand');
+      box.appendChild(el('div', 'sat-stand-name', stand));
+      const chips = el('div', 'sat-chips');
+      list.sort((x, y) => x.name.localeCompare(y.name, 'de', { numeric: true }));
+      for (const it of list) {
+        const idx = state.prefs.indexOf(it.name);
+        const chip = el('button', 'sat-chip' + (idx >= 0 ? ' sat-sel' : '') + (it.sale === false ? ' sat-off' : '') +
+          (it.free === 0 ? ' sat-full' : '') + (it.ga ? ' sat-ga' : ''));
+        chip.type = 'button';
+        if (idx >= 0) chip.appendChild(el('span', 'sat-chip-n', String(idx + 1)));
+        chip.appendChild(el('span', 'sat-chip-name', it.name));
+        if (it.free) chip.appendChild(el('span', 'sat-chip-free', String(it.free)));
+        if (it.cap) chip.appendChild(el('span', 'sat-chip-tag', 'max ' + it.cap));
+        chip.title = [it.name, it.ga ? 'staanplaatsen: die koop je met de hand' : null,
+          it.sale === false ? 'nu niet te koop · wordt bewaakt' : null,
+          it.resale ? 'ook Ticketbörse' : null,
+          it.free != null ? it.free + ' vrij' : null].filter(Boolean).join(' · ');
+        chip.addEventListener('click', () => toggleBlock(it.name));
+        chips.appendChild(chip);
+      }
+      box.appendChild(chips);
+      ui.blocks.appendChild(box);
+    }
+    render();
+  }
+
+  function toggleBlock(name) {
+    const i = state.prefs.indexOf(name);
+    if (i >= 0) state.prefs.splice(i, 1);
+    else state.prefs.push(name);
+    savePrefs();
     renderBlocks();
+    groupSync();
   }
 
   // Event cards on the shop's index: id, label, match date, and whether the
@@ -912,7 +1286,6 @@
   }
 
   // ------------------------------------------------------------ schedule ---
-  const ext = typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null);
 
   async function loadSchedule() {
     if (!ext || !ext.runtime || !ext.runtime.sendMessage) return;
@@ -1029,11 +1402,11 @@
       await fetchAvailability();
       renderBlocks();
       setCounter([...state.free].filter(id => !state.selected.length || state.selected.includes(core.blockOf(id))).length);
-      setStatus('Stoelplan open');
-      log('🧩 ' + state.blocks.length + ' blokken geladen, ' + state.free.size + ' stoelen vrij.');
+      log('🧩 ' + state.blocks.length + ' vakken geladen, ' + state.free.size + ' stoelen vrij.');
     } catch (e) { onError(e); }
   }
 
+  // Your blocks stay: they are kept by name per stadium, not per match.
   function onEventChange() {
     const id = ui.event.value ? Number(ui.event.value) : null;
     if (id === state.eventId) return;
@@ -1050,7 +1423,9 @@
     state.selected = [];
     state.free = new Set();
     state.ga = new Map();
-    ui.status.textContent = '';
+    state.foreignVenue = false;
+    state.saleAt = null;
+    state.freeMine = null;
     saveSettings();
     renderBlocks();
     groupSync();
@@ -1097,9 +1472,114 @@
   function updateCountdown() {
     renderSales();
     checkSaleAlerts();
-    if (!state.running || !state.timer) { ui.next.textContent = ''; return; }
-    const s = Math.max(0, Math.round((state.nextAt - Date.now()) / 1000));
-    ui.next.textContent = 'volgende check over ' + s + ' s';
+    if (state.cartUntil && Date.now() > state.cartUntil) {
+      state.cartUntil = 0;
+      state.cartSeats = [];
+      saveCartPhase();
+      log('⌛ De reservering in je winkelwagen is verlopen.');
+      render();
+      return;
+    }
+    const ph = phase();
+    renderPhase(ph);
+    renderChip(ph);
+    // Keep the cart's countdown on the shop's clock, not just ours.
+    if (ph === 'cart' && Date.now() - (state.cartSyncAt || 0) > 60000) {
+      state.cartSyncAt = Date.now();
+      syncCartTime();
+    }
+  }
+
+  // ------------------------------------------------------------- docking ---
+  // Docked, the panel is a full-height bar on the right and the shop makes
+  // room for it: the page gets a right margin, and the shop's own fixed parts
+  // (header, cookie notice), which are placed against the window and so
+  // ignore that margin, are moved aside — and put back when you undock.
+  // Below DOCK_MIN_SCREEN the shop would get too narrow: then it floats.
+  const DOCK_KEY = 'satDock';
+  const DOCK_W = 400;
+  const DOCK_MIN_W = 44;          // folded: a strip with the phase chip
+  const DOCK_MIN_SCREEN = 1100;
+  const dock = { want: true, on: false, observer: null, timer: null, moved: new Map() };
+
+  const dockWidth = () => (ui.panel.classList.contains('sat-min') ? DOCK_MIN_W : DOCK_W);
+
+  function applyDock() {
+    const p = ui.panel;
+    const on = dock.want && window.innerWidth >= DOCK_MIN_SCREEN;
+    restoreFixed();
+    if (on) {
+      p.classList.add('sat-docked');
+      p.style.left = 'auto';
+      p.style.top = '0';
+      p.style.right = '0';
+      p.style.bottom = '0';
+      document.documentElement.style.setProperty('margin-right', dockWidth() + 'px', 'important');
+      if (!dock.on) {
+        dock.observer = new MutationObserver(scheduleFit);
+        dock.observer.observe(document.body, { childList: true, subtree: true });
+        window.addEventListener('scroll', scheduleFit, { passive: true });
+      }
+      dock.on = true;
+      fitFixed();
+    } else {
+      if (dock.on) {
+        dock.observer.disconnect();
+        window.removeEventListener('scroll', scheduleFit);
+      }
+      dock.on = false;
+      p.classList.remove('sat-docked');
+      document.documentElement.style.removeProperty('margin-right');
+      applyPanelPos(readPanelPos());
+    }
+    ui.dockBtn.textContent = dock.want ? '⧉' : '⇥';
+    ui.dockBtn.title = dock.want ? 'Zwevend paneel' : 'Als zijbalk naast de shop';
+  }
+
+  function scheduleFit() {
+    if (dock.timer) return;
+    dock.timer = setTimeout(() => { dock.timer = null; if (dock.on) fitFixed(); }, 400);
+  }
+
+  // Fixed parts of the shop that reach under the bar: full-width ones end at
+  // the bar, right-anchored ones (a cookie notice) move left by its width.
+  // The seat plan (SVG) and the panel itself are skipped, which keeps this
+  // cheap on big pages.
+  function fitFixed() {
+    const w = dockWidth();
+    const edge = window.innerWidth - w;
+    const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+      acceptNode: n => (n === ui.panel || n.namespaceURI === 'http://www.w3.org/2000/svg'
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
+    for (let el = walk.nextNode(); el; el = walk.nextNode()) {
+      if (dock.moved.has(el)) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed') continue;
+      const r = el.getBoundingClientRect();
+      if (!r.width || r.right <= edge + 1) continue;
+      const saved = {};
+      for (const k of ['right', 'width', 'max-width']) saved[k] = [el.style.getPropertyValue(k), el.style.getPropertyPriority(k)];
+      dock.moved.set(el, saved);
+      if (r.left <= 1 && r.width >= window.innerWidth - 2) {
+        el.style.setProperty('right', w + 'px', 'important');
+        el.style.setProperty('width', 'auto', 'important');
+        el.style.setProperty('max-width', edge + 'px', 'important');
+      } else {
+        el.style.setProperty('right', ((parseFloat(cs.right) || 0) + w) + 'px', 'important');
+      }
+    }
+  }
+
+  function restoreFixed() {
+    for (const [el, saved] of dock.moved) {
+      for (const k of Object.keys(saved)) {
+        const [v, prio] = saved[k];
+        if (v) el.style.setProperty(k, v, prio);
+        else el.style.removeProperty(k);
+      }
+    }
+    dock.moved.clear();
   }
 
   // Drag the panel by its header; double-click the header to snap it back.
@@ -1134,6 +1614,7 @@
   function makeDraggable(head) {
     let start = null;
     head.addEventListener('mousedown', (e) => {
+      if (dock.on) return;
       if (e.button !== 0 || e.target.closest('button')) return;
       const r = ui.panel.getBoundingClientRect();
       start = { x: e.clientX, y: e.clientY, left: r.left, top: r.top, moved: false };
@@ -1157,11 +1638,11 @@
       start = null;
     });
     head.addEventListener('dblclick', (e) => {
-      if (e.target.closest('button')) return;
+      if (dock.on || e.target.closest('button')) return;
       savePanelPos(null);
       applyPanelPos(null);
     });
-    window.addEventListener('resize', () => applyPanelPos(readPanelPos()));
+    window.addEventListener('resize', () => (dock.want ? applyDock() : applyPanelPos(readPanelPos())));
   }
 
   function buildPanel() {
@@ -1170,37 +1651,51 @@
     // Static markup only: the AMO linter flags any non-literal innerHTML.
     panel.innerHTML =
       '<div class="sat-head"><span class="sat-title">Seat Assist</span>' +
+      '<span class="sat-phasechip"></span>' +
       '<span class="sat-token">…</span>' +
+      '<button class="sat-dock" title="Zwevend paneel">⧉</button>' +
       '<button class="sat-collapse" title="in-/uitklappen">–</button></div>' +
       '<div class="sat-body">' +
-      '  <div class="sat-row"><button class="sat-events">Wedstrijden laden</button>' +
-      '    <select class="sat-event"></select></div>' +
-      '  <div class="sat-label">Blokken (klik = prioriteit, niets gekozen = alle): <button class="sat-refresh" title="blokken en vrije plaatsen verversen">↻</button></div>' +
-      '  <div class="sat-sections"></div>' +
-      '  <div class="sat-row"><label>Aantal: <input type="number" class="sat-count" min="1" value="1"></label>' +
-      '    <select class="sat-mode" title="Hoe de stoelen bij elkaar moeten liggen">' +
-      '      <option value="row">naast elkaar in één rij</option><option value="cluster">cluster (max 3 rijen)</option><option value="loose">los</option>' +
-      '    </select>' +
-      '    <select class="sat-kind" title="Welke plaatsen tellen mee">' +
-      '      <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +
-      '    </select></div>' +
-      '  <div class="sat-row"><label title="Rond dit tijdstip (vandaag) kijkt hij elke 5 seconden">Verkoopstart <input type="time" class="sat-armtime"></label>' +
-      '    <input type="text" class="sat-armmatch" placeholder="auto-start: wedstrijd bevat…" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
-      '  <div class="sat-row"><label title="Koop samen met accounts in andere Firefox-containers: naast elkaar, max 2 rijen. Elk account koopt zijn eigen aantal.">' +
-      '<input type="checkbox" class="sat-group"> Samen zitten (groep)</label> <span class="sat-groupinfo"></span></div>' +
-      '  <div class="sat-row"><button class="sat-start">▶ Start</button><button class="sat-stop" disabled>■ Stop</button>' +
-      '    <span class="sat-next"></span>' +
-      '    <button class="sat-clear" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Leeg</button></div>' +
-      '  <div class="sat-watchcard"></div>' +
-      '  <div class="sat-sales"></div>' +
-      '  <div class="sat-counter sat-idle">Vrij nu: —</div>' +
-      '  <div class="sat-log"></div>' +
+      '  <div class="sat-phase"></div>' +
+      '  <div class="sat-row sat-cartbar"><button class="sat-start sat-pay">Afrekenen →</button>' +
+      '    <button class="sat-clear sat-clear-cart">🗑 Leegmaken</button></div>' +
+      '  <div class="sat-row sat-runbar"><button class="sat-stop">■ Stop</button>' +
+      '    <button class="sat-edit" title="Stopt en gaat terug naar instellen">Wijzigen</button></div>' +
+      '  <div class="sat-check"></div>' +
+      '  <div class="sat-setup">' +
+      '    <div class="sat-h">Wedstrijd</div>' +
+      '    <div class="sat-row"><select class="sat-event"></select>' +
+      '      <button class="sat-events sat-icon" title="Wedstrijdlijst verversen">↻</button></div>' +
+      '    <div class="sat-h">Vakken <span class="sat-sub">klik in volgorde van voorkeur · niets gekozen = alle</span>' +
+      '      <button class="sat-refresh sat-icon" title="Vrije plaatsen verversen">↻</button></div>' +
+      '    <div class="sat-sections"></div>' +
+      '    <div class="sat-row"><label>Aantal <input type="number" class="sat-count" min="1" value="1"></label>' +
+      '      <label title="Rond dit tijdstip (vandaag) kijkt hij elke 5 seconden">Verkoopstart <input type="time" class="sat-armtime"></label></div>' +
+      '    <div class="sat-row"><label title="Koop samen met accounts in andere Firefox-containers: naast elkaar, max 2 rijen. Elk account koopt zijn eigen aantal.">' +
+      '      <input type="checkbox" class="sat-group"> Samen zitten met andere accounts</label></div>' +
+      '    <div class="sat-sales"></div>' +
+      '    <details class="sat-more"><summary>Meer opties</summary>' +
+      '      <div class="sat-row"><label>Stoelen <select class="sat-mode" title="Hoe de stoelen bij elkaar moeten liggen (niet bij samen zitten)">' +
+      '        <option value="row">naast elkaar in één rij</option><option value="cluster">cluster (max 3 rijen)</option><option value="loose">los</option>' +
+      '      </select></label>' +
+      '      <label>Soort <select class="sat-kind" title="Welke plaatsen tellen mee">' +
+      '        <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +
+      '      </select></label></div>' +
+      '      <div class="sat-row"><input type="text" class="sat-armmatch" placeholder="Auto-start: wedstrijd waarvan de naam … bevat" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
+      '      <div class="sat-row"><button class="sat-clear sat-clear-more" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
+      '    </details>' +
+      '    <div class="sat-row"><button class="sat-start sat-go">▶ Start</button></div>' +
+      '  </div>' +
+      '  <details class="sat-logbox"><summary>Logboek <span class="sat-lastlog"></span></summary><div class="sat-log"></div></details>' +
       '</div>';
     document.body.appendChild(panel);
 
     ui.panel = panel;
     ui.token = panel.querySelector('.sat-token');
+    ui.chip = panel.querySelector('.sat-phasechip');
     panel.querySelector('.sat-title').textContent = 'Seat Assist · ' + CLUB;
+    ui.phase = panel.querySelector('.sat-phase');
+    ui.check = panel.querySelector('.sat-check');
     ui.event = panel.querySelector('.sat-event');
     ui.blocks = panel.querySelector('.sat-sections');
     ui.count = panel.querySelector('.sat-count');
@@ -1209,14 +1704,10 @@
     ui.armTime = panel.querySelector('.sat-armtime');
     ui.armMatch = panel.querySelector('.sat-armmatch');
     ui.group = panel.querySelector('.sat-group');
-    ui.groupInfo = panel.querySelector('.sat-groupinfo');
-    ui.startBtn = panel.querySelector('.sat-start');
-    ui.stopBtn = panel.querySelector('.sat-stop');
-    ui.next = panel.querySelector('.sat-next');
-    ui.status = panel.querySelector('.sat-watchcard');
+    ui.go = panel.querySelector('.sat-go');
     ui.sales = panel.querySelector('.sat-sales');
-    ui.counter = panel.querySelector('.sat-counter');
     ui.log = panel.querySelector('.sat-log');
+    ui.lastLog = panel.querySelector('.sat-lastlog');
 
     panel.querySelector('.sat-events').addEventListener('click', loadEvents);
     panel.querySelector('.sat-refresh').addEventListener('click', refreshBlocks);
@@ -1227,28 +1718,30 @@
       ui.count.value = String(state.want);
       saveSettings();
       groupSync();
+      render();
     });
     ui.group.addEventListener('change', async () => {
       state.group = ui.group.checked;
       saveSettings();
       if (state.group) {
-        log('👥 Groep aan. Doe hetzelfde in een tabblad per account (elk in een eigen container); elk account koopt zijn eigen aantal, samen naast elkaar.');
+        log('👥 Samen zitten aan. Zet het in elke container met een ander account ook aan; elk account koopt zijn eigen aantal, samen naast elkaar.');
         await groupSync();
         adoptGroupConfig();
       } else {
         await groupSend('leave');
         state.groupView = null;
-        renderGroup();
-        log('👥 Groep uit; dit account koopt weer voor zichzelf.');
+        log('👥 Samen zitten uit; dit account koopt weer voor zichzelf.');
       }
+      render();
     });
     ui.mode.addEventListener('change', () => { state.mode = ui.mode.value; saveSettings(); });
-    ui.kind.addEventListener('change', () => { state.kind = ui.kind.value; saveSettings(); });
+    ui.kind.addEventListener('change', () => { state.kind = ui.kind.value; saveSettings(); groupSync(); });
     ui.armTime.addEventListener('change', () => {
       state.armTime = ui.armTime.value;
       saveSettings();
       log(state.armTime ? '⏱ Verkoopstart ' + state.armTime + ': van 2 min ervoor tot 15 min erna kijkt hij elke 5 s.' : '⏱ Geen verkoopstart ingesteld.');
       warnLogin();
+      render();
     });
     ui.armMatch.addEventListener('change', () => {
       state.armMatch = ui.armMatch.value.trim();
@@ -1257,18 +1750,29 @@
       log(state.armMatch ? '🚀 Auto-start zodra "' + state.armMatch + '" tickets heeft.' : '🚀 Auto-start uit.');
       warnLogin();
     });
-    ui.startBtn.addEventListener('click', start);
-    ui.stopBtn.addEventListener('click', stop);
-    panel.querySelector('.sat-clear').addEventListener('click', clearCart);
+    ui.go.addEventListener('click', start);
+    panel.querySelector('.sat-stop').addEventListener('click', stop);
+    panel.querySelector('.sat-edit').addEventListener('click', stop);
+    panel.querySelector('.sat-pay').addEventListener('click', () => { window.location.href = SHOP + '/shoppingcart'; });
+    panel.querySelector('.sat-clear-cart').addEventListener('click', clearCart);
+    panel.querySelector('.sat-clear-more').addEventListener('click', clearCart);
     panel.querySelector('.sat-collapse').addEventListener('click', (e) => {
       panel.classList.toggle('sat-min');
       e.target.textContent = panel.classList.contains('sat-min') ? '+' : '–';
+      if (dock.on) applyDock();
+    });
+    ui.dockBtn = panel.querySelector('.sat-dock');
+    ui.dockBtn.addEventListener('click', () => {
+      dock.want = !dock.want;
+      try { window.localStorage.setItem(DOCK_KEY, dock.want ? '1' : '0'); } catch (e) { /* not kept */ }
+      applyDock();
     });
 
     const head = panel.querySelector('.sat-head');
     head.title = 'Sleep om te verplaatsen · dubbelklik voor de standaardplek';
     makeDraggable(head);
-    applyPanelPos(readPanelPos());
+    try { dock.want = window.localStorage.getItem(DOCK_KEY) !== '0'; } catch (e) { /* default: docked */ }
+    applyDock();
 
     // Restore what was chosen before this page load.
     const s = readSettings();
@@ -1276,7 +1780,6 @@
       state.eventId = s.eventId != null ? Number(s.eventId) : null;
       state.eventLabel = s.eventLabel || null;
       state.eventDate = s.eventDate || null;
-      state.selected = Array.isArray(s.selected) ? s.selected.map(Number) : [];
       state.want = s.want >= 1 ? s.want : 1;
       state.mode = MODE_TEXT[s.mode] ? s.mode : (s.together === false ? 'loose' : 'row');
       state.kind = ['all', 'sale', 'resale'].includes(s.kind) ? s.kind : 'all';
@@ -1290,7 +1793,6 @@
       state.eventId = Number(here[1]);
       state.eventLabel = null;
       state.eventDate = null;
-      state.selected = [];
       saveSettings();
     }
     // This page already holds what loadVenue would fetch (signature, blocks,
@@ -1305,8 +1807,8 @@
     ui.armTime.value = state.armTime;
     ui.armMatch.value = state.armMatch;
     ui.group.checked = state.group;
+    restoreCartPhase();
     fillEvents();
-    renderBlocks();
 
     const logged = [...document.scripts].map(x => /"user_logged":(true|false)/.exec(x.textContent)).find(Boolean);
     setLogin(logged ? logged[1] === 'true' : null);
@@ -1319,16 +1821,23 @@
     loadSchedule();
     setInterval(loadSchedule, SCHEDULE_REFRESH_MS);
     setTimeout(watchEvents, 3000);
-    // Register with the group right away (before the queue), and keep the
-    // line about it current.
-    if (state.group) groupSync().then(adoptGroupConfig);
     setInterval(() => { if (state.group && !state.running) groupSync(); }, 15000);
-    log('Klaar. Log in, klik "Wedstrijden laden" en kies een wedstrijd.');
+    log('Klaar. Kies een wedstrijd en je vakken; de checklist laat zien wat er nog mist.');
 
-    if (wasRunning() && state.eventId != null) {
-      log('↻ Hervat na het laden van de pagina.');
-      sleep(1500).then(start);
-    }
+    // The stadium and your blocks live in extension storage (shared by all
+    // containers); wait for them before resuming or registering the group.
+    Promise.all([storeGet(STADIUM_KEY), storeGet(PREFS_KEY)]).then(([stadium, prefs]) => {
+      state.stadium = stadium && Array.isArray(stadium.blocks) ? stadium : null;
+      state.prefs = Array.isArray(prefs) ? prefs : [];
+      applyPrefs();
+      renderBlocks();
+      if (state.eventId != null && !state.blocks.length && state.venue && state.venue.seatmap) refreshBlocks();
+      if (state.group) groupSync().then(adoptGroupConfig);
+      if (wasRunning() && state.eventId != null) {
+        log('↻ Hervat na het laden van de pagina.');
+        sleep(1500).then(start);
+      }
+    });
   }
 
   buildPanel();

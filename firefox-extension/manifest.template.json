@@ -4,6 +4,7 @@
   "version": "1.2.5",
   "description": "Monitort voorkeursvakken in Tymes4- en TIXX-ticketshops en zet zodra mogelijk een stoel in je winkelwagen. Draait binnen je ingelogde shop-sessie.",
   "permissions": [
+    "storage",
     "__API_ORIGIN__/*",
     "__SHOP_ORIGIN__/*",
     "__TIXX_SCHEDULE_PERMS__",

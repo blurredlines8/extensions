@@ -19,3 +19,6 @@ firefox-extension/.amo-upload-uuid
 # Documentatie blijft lokaal — noemt de doelomgeving bij naam
 AGENTS.md
 */README.md
+
+# HAR-exports bevatten sessiecookies en tokens — nooit committen
+*.har
