@@ -3,11 +3,11 @@
 
 # Build-output: gegenereerd door build.sh uit src/ + manifest.template.json,
 # met de shop-URL's uit .env ingevuld. Hoort niet in de repo.
-firefox-extension/content.js
-firefox-extension/styles.css
+firefox-extension/*.js
+firefox-extension/*.css
 firefox-extension/manifest.json
-chrome-extension/content.js
-chrome-extension/styles.css
+chrome-extension/*.js
+chrome-extension/*.css
 chrome-extension/manifest.json
 
 # Build-output en tooling

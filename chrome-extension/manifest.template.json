@@ -2,16 +2,28 @@
   "manifest_version": 3,
   "name": "Seat Assist (persoonlijk)",
   "version": "1.2.3",
-  "description": "Monitort voorkeursvakken en zet zodra mogelijk een stoel in je winkelwagen. Draait binnen je ingelogde shop-sessie en pakt het token automatisch uit sessionStorage.",
+  "description": "Monitort voorkeursvakken in Tymes4- en TIXX-ticketshops en zet zodra mogelijk een stoel in je winkelwagen. Draait binnen je ingelogde shop-sessie.",
   "host_permissions": [
     "__API_ORIGIN__/*",
-    "__SHOP_ORIGIN__/*"
+    "__SHOP_ORIGIN__/*",
+    "__TIXX_SCHEDULE_PERMS__",
+    "__TIXX_API_ORIGIN__/*",
+    "__TIXX_SHOP_ORIGIN__/*"
   ],
+  "background": {
+    "service_worker": "tixx-background.js"
+  },
   "content_scripts": [
     {
       "matches": ["__SHOP_ORIGIN__/*"],
-      "js": ["content.js"],
-      "css": ["styles.css"],
+      "js": ["tymes4-content.js"],
+      "css": ["tymes4.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["__TIXX_SHOP_ORIGIN____TIXX_SHOP_PATHS__/*"],
+      "js": ["tixx-core.js", "tixx-content.js"],
+      "css": ["tixx.css"],
       "run_at": "document_idle"
     }
   ]

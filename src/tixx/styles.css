@@ -1,0 +1,500 @@
+/* Seat Assist (TIXX) — panel styles.
+   All rules are scoped under #sat-panel / #sat-banner so nothing leaks into the
+   host shop page. Design tokens live on #sat-panel as CSS custom properties. */
+
+#sat-panel {
+  --sat-bg: #15151a;
+  --sat-surface: #1e1e25;
+  --sat-surface-2: #272730;
+  --sat-border: #2c2c35;
+  --sat-border-2: #3a3a46;
+  --sat-text: #ececf1;
+  --sat-muted: #9a9aa6;
+  --sat-faint: #6b6b76;
+  --sat-accent: #e2001a;
+  --sat-green: #1f9d55;
+  --sat-green-2: #23b061;
+  --sat-green-bg: #12321f;
+  --sat-green-text: #6fe6a1;
+  --sat-red: #c23b3b;
+  --sat-red-bg: #3a1414;
+  --sat-red-text: #ff9b9b;
+  --sat-code-bg: #101014;
+  --sat-nonseat-bg: #24242c;
+  --sat-nonseat-line: #4a4a57;
+  --sat-scroll: #33333d;
+  --sat-r: 10px;
+  --sat-r-sm: 7px;
+  --sat-r-xs: 5px;
+
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  z-index: 2147483647;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--sat-text);
+  background: var(--sat-bg);
+  border: 1px solid var(--sat-border);
+  border-radius: var(--sat-r);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+/* Forced colours (system high contrast): let the system win, but keep the
+   surfaces distinguishable with borders. */
+@media (forced-colors: active) {
+  #sat-panel,
+  #sat-panel .sat-watchcard,
+  #sat-panel .sat-sections,
+  #sat-panel .sat-log { border: 1px solid CanvasText; }
+}
+
+#sat-panel *,
+#sat-panel *::before,
+#sat-panel *::after { box-sizing: border-box; }
+
+/* Follow the browser/OS setting. Dark is the default (tokens above); light
+   kicks in automatically when the system prefers a light appearance. */
+@media (prefers-color-scheme: light) {
+  #sat-panel {
+    --sat-bg: #ffffff;
+    --sat-surface: #f4f4f7;
+    --sat-surface-2: #e9e9ef;
+    --sat-border: #e3e3ea;
+    --sat-border-2: #d3d3dc;
+    --sat-text: #1b1b22;
+    --sat-muted: #64646f;
+    --sat-faint: #9a9aa6;
+    --sat-accent: #e2001a;
+    --sat-green: #16a34a;
+    --sat-green-2: #128a3e;
+    --sat-green-bg: #e6f6ec;
+    --sat-green-text: #157f3a;
+    --sat-red: #d64545;
+    --sat-red-bg: #fdecec;
+    --sat-red-text: #c0392b;
+    --sat-code-bg: #f3f3f6;
+    --sat-nonseat-bg: #e4e4ea;
+    --sat-nonseat-line: #b6b6c2;
+    --sat-scroll: #cfcfd8;
+    box-shadow: 0 12px 48px rgba(20, 20, 30, 0.18);
+  }
+}
+
+#sat-panel ::-webkit-scrollbar { width: 8px; height: 8px; }
+#sat-panel ::-webkit-scrollbar-thumb { background: var(--sat-scroll); border-radius: 4px; }
+#sat-panel ::-webkit-scrollbar-track { background: transparent; }
+
+/* Header */
+#sat-panel .sat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  background: var(--sat-surface);
+  border-bottom: 1px solid var(--sat-border);
+  /* The header is the drag handle. */
+  cursor: grab;
+  user-select: none;
+}
+#sat-panel.sat-dragging .sat-head { cursor: grabbing; }
+/* No transitions or pointer events on the shop while dragging. */
+#sat-panel.sat-dragging { user-select: none; }
+/* Collapsed it is just the header bar — park it in a corner and read on. */
+#sat-panel.sat-min { width: auto; min-width: 220px; }
+#sat-panel.sat-min .sat-head { border-bottom: none; }
+#sat-panel .sat-head > span:first-child {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+#sat-panel .sat-head > span:first-child::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--sat-accent);
+  box-shadow: 0 0 0 3px rgba(226, 0, 26, 0.15);
+}
+#sat-panel .sat-token {
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  /* The pill now carries "ingelogd · 14u 9m geldig"; never let it push the
+     collapse button out of the header on a narrow viewport. */
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+}
+#sat-panel .sat-token.sat-ok {
+  color: var(--sat-green-text);
+  background: var(--sat-green-bg);
+  border-color: rgba(111, 230, 161, 0.15);
+}
+#sat-panel .sat-token.sat-bad {
+  color: var(--sat-red-text);
+  background: var(--sat-red-bg);
+  border-color: rgba(255, 155, 155, 0.15);
+}
+#sat-panel .sat-collapse {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--sat-muted);
+  background: transparent;
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-xs);
+  cursor: pointer;
+}
+#sat-panel .sat-collapse:hover { color: var(--sat-text); background: var(--sat-surface-2); }
+
+/* Body */
+#sat-panel .sat-body {
+  min-height: 0;          /* required to be able to scroll inside the flex column */
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 14px;
+  overflow-y: auto;
+}
+#sat-panel.sat-min .sat-body { display: none; }
+
+#sat-panel .sat-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#sat-panel .sat-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--sat-muted);
+}
+
+/* Buttons */
+#sat-panel button {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--sat-text);
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-sm);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+#sat-panel button:hover { background: var(--sat-surface-2); }
+#sat-panel button:disabled { opacity: 0.45; cursor: default; }
+#sat-panel .sat-start {
+  color: #eafff2;
+  background: var(--sat-green);
+  border-color: transparent;
+}
+#sat-panel .sat-start:hover:not(:disabled) { background: var(--sat-green-2); }
+#sat-panel .sat-stop {
+  color: #ffecec;
+  background: var(--sat-red);
+  border-color: transparent;
+}
+#sat-panel .sat-stop:hover:not(:disabled) { background: #d24a4a; }
+#sat-panel .sat-reload { margin-left: auto; }
+/* Destructive: releases the tickets, so set it apart from Herlaad. */
+#sat-panel .sat-clear { color: var(--sat-red-text); border-color: var(--sat-red); }
+#sat-panel .sat-clear:hover:not(:disabled) { background: var(--sat-red-bg); }
+
+/* Icon / ghost buttons */
+#sat-panel .sat-refresh,
+#sat-panel .sat-seatbtn {
+  padding: 2px 7px;
+  font-size: 12px;
+  color: var(--sat-muted);
+  background: transparent;
+  border-color: var(--sat-border);
+}
+#sat-panel .sat-refresh:hover,
+#sat-panel .sat-seatbtn:hover { color: var(--sat-text); background: var(--sat-surface-2); }
+
+/* Inputs */
+#sat-panel select,
+#sat-panel input[type="number"] {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--sat-text);
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-sm);
+  padding: 6px 8px;
+}
+#sat-panel select { flex: 1; min-width: 0; }
+#sat-panel input[type="number"] { width: 64px; }
+#sat-panel select:focus,
+#sat-panel input:focus {
+  outline: none;
+  border-color: var(--sat-accent);
+  box-shadow: 0 0 0 2px rgba(226, 0, 26, 0.18);
+}
+#sat-panel label { display: inline-flex; align-items: center; gap: 6px; color: var(--sat-muted); }
+
+/* Sections list */
+#sat-panel .sat-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* Without this the flex column squeezes the list down to a single row as
+     soon as anything is added (such as the status card). */
+  flex: 0 0 auto;
+  min-height: 92px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border);
+  border-radius: var(--sat-r-sm);
+}
+#sat-panel .sat-sec {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px 5px 8px;
+  border-radius: var(--sat-r-xs);
+  color: var(--sat-text);
+}
+#sat-panel .sat-sec:hover { background: var(--sat-surface-2); }
+#sat-panel .sat-sec.sat-sel { background: var(--sat-green-bg); color: var(--sat-green-text); font-weight: 600; }
+#sat-panel .sat-sec.sat-full { color: var(--sat-faint); }
+#sat-panel .sat-sec.sat-full.sat-sel { color: var(--sat-green-text); }
+#sat-panel .sat-sec-label { flex: 1; cursor: pointer; }
+#sat-panel .sat-seatbtn { flex: 0 0 auto; }
+
+/* Counter */
+#sat-panel .sat-counter {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--sat-green-text);
+  background: var(--sat-green-bg);
+  border: 1px solid rgba(111, 230, 161, 0.12);
+  border-radius: var(--sat-r-sm);
+  padding: 7px 10px;
+}
+
+#sat-panel .sat-counter.sat-idle {
+  color: var(--sat-muted);
+  background: var(--sat-surface);
+  border-color: var(--sat-border);
+}
+
+/* Event status card */
+#sat-panel .sat-watchcard:empty { display: none; }
+#sat-panel .sat-watchcard {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border);
+  border-radius: var(--sat-r-sm);
+}
+#sat-panel .sat-wc-title { font-weight: 600; font-size: 12.5px; color: var(--sat-text); }
+#sat-panel .sat-wc-status { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+#sat-panel .sat-wc-badge { font-size: 14px; font-weight: 700; color: var(--sat-muted); }
+#sat-panel .sat-wc-open .sat-wc-badge { color: var(--sat-green-text); }
+#sat-panel .sat-wc-count {
+  font-size: 12px; color: var(--sat-text); font-variant-numeric: tabular-nums;
+}
+#sat-panel .sat-wc-button {
+  font-size: 11.5px; color: var(--sat-muted);
+  background: var(--sat-code-bg); border-radius: var(--sat-r-xs); padding: 4px 7px;
+}
+#sat-panel .sat-wc-metrics { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+#sat-panel .sat-wc-m { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--sat-text); }
+#sat-panel .sat-wc-dim { color: var(--sat-muted); }
+#sat-panel .sat-wc-strong { color: var(--sat-green-text); font-weight: 600; }
+#sat-panel .sat-wc-flags { display: flex; flex-wrap: wrap; gap: 4px; }
+#sat-panel .sat-wc-flag {
+  font-size: 10.5px; padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--sat-border-2); color: var(--sat-muted);
+}
+#sat-panel .sat-wc-pl {
+  font-size: 11px;
+  color: var(--sat-muted);
+  font-variant-numeric: tabular-nums;
+}
+#sat-panel .sat-wc-foot { font-size: 10.5px; color: var(--sat-faint); }
+
+/* Log */
+#sat-panel .sat-log {
+  /* Like the sections list: without this the flex column squeezes the log down
+     to a sliver once the card appears. Let the body scroll instead. */
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--sat-muted);
+  background: var(--sat-code-bg);
+  border: 1px solid var(--sat-border);
+  border-radius: var(--sat-r-sm);
+  padding: 8px 10px;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#sat-panel .sat-log > div { padding: 1px 0; }
+
+/* Seat picker overlay */
+#sat-panel .sat-picker {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  flex-direction: column;
+  background: var(--sat-bg);
+}
+#sat-panel .sat-picker-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  background: var(--sat-surface);
+  border-bottom: 1px solid var(--sat-border);
+}
+#sat-panel .sat-picker-head > span:first-child { flex: 1; font-weight: 600; }
+#sat-panel .sat-picker-count { font-size: 11px; color: var(--sat-muted); }
+#sat-panel .sat-picker-head button { padding: 3px 9px; font-size: 12px; }
+#sat-panel .sat-picker-legend { font-size: 11px; color: var(--sat-muted); padding: 8px 14px 4px; }
+#sat-panel .sat-picker-grid { flex: 1; overflow: auto; padding: 6px 14px 14px; }
+#sat-panel .sat-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+}
+#sat-panel .sat-picker-rowlabel { flex: 0 0 46px; font-size: 10px; color: var(--sat-faint); }
+#sat-panel .sat-seat {
+  flex: 0 0 auto;
+  width: 21px;
+  height: 21px;
+  padding: 0;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--sat-muted);
+  background: var(--sat-surface-2);
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-xs);
+  cursor: pointer;
+}
+#sat-panel .sat-seat:not(:disabled):hover { color: var(--sat-text); border-color: var(--sat-green-text); }
+#sat-panel .sat-seat.sat-seat-taken {
+  opacity: 0.4;
+  cursor: default;
+}
+#sat-panel .sat-seat.sat-seat-nonseat {
+  color: transparent;
+  cursor: default;
+  opacity: 1;
+  background-color: var(--sat-nonseat-bg);
+  border-color: var(--sat-border);
+  background-image:
+    linear-gradient(45deg, transparent 43%, var(--sat-nonseat-line) 43%, var(--sat-nonseat-line) 57%, transparent 57%),
+    linear-gradient(-45deg, transparent 43%, var(--sat-nonseat-line) 43%, var(--sat-nonseat-line) 57%, transparent 57%);
+}
+#sat-panel .sat-seat.sat-seat-chosen {
+  color: #fff;
+  background: var(--sat-green);
+  border-color: var(--sat-green);
+  opacity: 1;
+}
+
+/* Success banner (injected at the top of the page) */
+#sat-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 22px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(90deg, #1f9d55, #158043);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+#sat-banner button {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  color: #158043;
+  background: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+/* TIXX additions */
+#sat-panel .sat-hint { padding: 6px 8px; font-size: 12px; color: var(--sat-muted); }
+#sat-panel .sat-sec { cursor: pointer; }
+#sat-panel .sat-sec-free {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--sat-green-text);
+}
+#sat-panel .sat-sec.sat-ga .sat-sec-label { font-style: italic; }
+#sat-panel .sat-next {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--sat-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Sale moments */
+#sat-panel .sat-sales:empty { display: none; }
+#sat-panel .sat-sales {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border);
+  border-radius: var(--sat-r-sm);
+}
+#sat-panel .sat-sale { display: flex; gap: 8px; font-size: 11.5px; color: var(--sat-muted); font-variant-numeric: tabular-nums; }
+#sat-panel .sat-sale-left { flex: 0 0 74px; color: var(--sat-text); font-weight: 600; }
+#sat-panel .sat-sale-mine { color: var(--sat-text); }
+#sat-panel .sat-sale-mine .sat-sale-left::after { content: " ★"; color: var(--sat-accent); }
+#sat-panel .sat-sale-open .sat-sale-left { color: var(--sat-green-text); }
+#sat-panel input[type="time"],
+#sat-panel input[type="text"] {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--sat-text);
+  background: var(--sat-surface);
+  border: 1px solid var(--sat-border-2);
+  border-radius: var(--sat-r-sm);
+  padding: 5px 8px;
+}
+#sat-panel input[type="text"] { flex: 1; min-width: 0; }

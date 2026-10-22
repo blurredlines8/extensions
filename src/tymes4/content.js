@@ -3,10 +3,14 @@
   if (window.__seatAssistLoaded) return;
   window.__seatAssistLoaded = true;
 
-  const API = '__API_ORIGIN__';
+  // Every club on Tymes4 runs the same shop with its own API host. build.sh
+  // fills in the shop → API pairs from .env; the shop we run on picks its API.
+  const SITES = __SITES__;
+  const API = SITES[location.origin];
+  if (!API) return;
   const INTERVAL_MS = 5000;
-  const CART_URL = '__SHOP_ORIGIN__/shopping-cart';
-  const SHOP_URL = '__SHOP_ORIGIN__/';
+  const CART_URL = location.origin + '/shopping-cart';
+  const SHOP_URL = location.origin + '/';
   // While there are no sections yet the monitor need not run at full speed;
   // that wait can last for days. The event record is refreshed on this same
   // slow cadence, since it changes rarely.

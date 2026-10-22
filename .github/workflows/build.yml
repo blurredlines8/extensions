@@ -38,6 +38,10 @@ jobs:
         env:
           API_ORIGIN: ${{ secrets.API_ORIGIN }}
           SHOP_ORIGIN: ${{ secrets.SHOP_ORIGIN }}
+          TIXX_API_ORIGIN: ${{ secrets.TIXX_API_ORIGIN }}
+          TIXX_SHOP_ORIGIN: ${{ secrets.TIXX_SHOP_ORIGIN }}
+          TIXX_SHOP_PATHS: ${{ secrets.TIXX_SHOP_PATHS }}
+          TIXX_SCHEDULES: ${{ secrets.TIXX_SCHEDULES }}
         run: ./build.sh
 
       - name: Versiebump terugcommitten
