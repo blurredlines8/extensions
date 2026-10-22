@@ -557,7 +557,7 @@
     if (!window.confirm('Alle kaarten uit de winkelwagen halen? Ze worden vrijgegeven.')) return;
     try {
       const items = core.parseCart(await (await shopFetch('/shoppingcart')).text());
-      if (!items.length) { log('🗑 Winkelwagen is al leeg.'); return; }
+      if (!items.length) { endCartPhase('🗑 Winkelwagen is al leeg.'); return; }
       for (const it of items) {
         await shopFetch('/shoppingcart/deleteitem/itemId/' + it.itemId, {
           method: 'POST',
@@ -581,7 +581,7 @@
     try {
       const items = core.parseCart(await (await shopFetch('/shoppingcart')).text())
         .filter(it => Number(it.eventId) === state.eventId);
-      if (!items.length) { log('Niks in de winkelwagen om te herladen.'); return; }
+      if (!items.length) { endCartPhase('Niks in de winkelwagen om te herladen.'); return; }
       if (Date.now() - state.venueAt > CLAIM_VENUE_MS) await loadVenue(state.eventId);
       if (!state.venue || !state.venue.seatmap) { log('✗ Geen stoelplan voor deze wedstrijd; herladen kan nu niet.'); return; }
       if (!state.blocks.length) await loadPlan();
@@ -858,8 +858,25 @@
     } catch (e) { /* none */ }
   }
 
+  function endCartPhase(msg) {
+    state.cartUntil = 0;
+    state.cartSeats = [];
+    state.cart = [];
+    saveCartPhase();
+    if (msg) log(msg);
+    render();
+  }
+
   // The shop's own countdown: POST shoppingcart/timeout → remaining min/sek.
+  // That timer runs per session, also with an empty cart, so first check that
+  // this match still has seats in the cart (emptied in the shop → phase over).
   async function syncCartTime() {
+    try {
+      const items = core.parseCart(await (await shopFetch('/shoppingcart')).text())
+        .filter(it => Number(it.eventId) === state.eventId);
+      if (!items.length) { endCartPhase('🗑 De winkelwagen is leeg; terug naar instellen.'); return; }
+      state.cart = items.map(it => it.seatId);
+    } catch (e) { /* keep the phase; the next check tries again */ }
     try {
       const res = await shopFetch('/shoppingcart/timeout', {
         method: 'POST',

@@ -1721,6 +1721,34 @@
       try { tok = await channelToken(id); } catch (e) { return; }
     }
     if (!orderId || !orderUID) return;
+    // The order may have been emptied in the shop itself: then the cart phase
+    // is over (also after a page load, when it was restored from the session).
+    try {
+      const details = await getOrderDetails(orderId, orderUID, tok);
+      const lines = (details && (details.OrderLines
+        || (details.PendingOrderDetails && details.PendingOrderDetails.OrderLines))) || [];
+      if (!lines.some(l => l.ProductType !== 2 && l.ProductType !== 3 && l.Id != null)) {
+        if (!tok) {
+          state.cart.orderId = null; state.cart.orderUID = null;
+          state.cart.placed = (state.cart.placed || []).filter(p => p.channel);
+        } else {
+          const id = Object.keys(chan.orders).map(Number).find(k => chan.orders[k] && chan.orders[k].orderId === orderId);
+          if (id != null) chan.orders[id] = { reservationId: null, reservationUID: null, orderId: null, orderUID: null };
+          saveChannelOrders();
+          state.cart.placed = (state.cart.placed || []).filter(p => p.channel !== id);
+        }
+        persistCart();
+        if (!state.cart.placed.length) {
+          state.cart.done = false;
+          state.cart.acquired = 0;
+          state.cartUntil = 0;
+          log('🗑 De winkelwagen is leeg; terug naar instellen.');
+          render();
+          return;
+        }
+        return syncCartTime();   // the other channel's cart still has seats
+      }
+    } catch (e) { /* keep the phase; the next check tries again */ }
     try {
       const res = await fetch(API + '/v2/PendingOrder/' + encodeURIComponent(orderId) + '/expiration/' + encodeURIComponent(orderUID), {
         credentials: 'omit', headers: headers(tok),
