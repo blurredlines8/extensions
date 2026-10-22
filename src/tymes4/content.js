@@ -31,6 +31,7 @@
     stadium: null,         // { sections: [{ name, stand }], at }: the home ground as last seen
     cartUntil: 0,          // when the cart's hold runs out (shop's own clock)
     hunt: null,            // { free, unit } for the search card: the figure that matters
+    notifyOn: false,       // a webhook is set on the options page
     quietSince: 0,         // since when nothing has been free in your sections (0 = something is)
     channelKind: 'all',    // home matches: 'all' | 'regulier' | 'tweedekans'
     note: '',              // one short line under it (away/placement cases)
@@ -287,6 +288,7 @@
         state.queue.staleWarned = true;
         log('⚠️ Wachtrij-token is ' + fmtDuration(over * 1000) + ' verlopen — de shop ververst niet meer. ' +
             'Ververs de pagina om je plaats te herstellen.');
+        notify('attention', '⚠️ De wachtrij van de shop zit vast; ververs de pagina om je plaats te herstellen.');
         beep(); flashTitle('⚠️ WACHTRIJ VAST');
         if (state.queue.autoReload && state.queue.reloads < 3) {
           state.queue.reloads++;
@@ -847,6 +849,37 @@
     else if (hunt && !state.quietSince) state.quietSince = Date.now();
     if (ui.panel) renderPhaseCard(phase());
   }
+
+  // --------------------------------------------------------- notifications ---
+  // A webhook you set on the options page (e.g. Home Assistant → Telegram);
+  // the background sends it. `key`: send this one only once per page.
+  const NOTIFY_KEY = 'notify:webhook';
+  const notified = new Set();
+  const clubName = () => location.hostname.split('.').slice(-2)[0] || '';
+  function eventName() {
+    const ev = state.events.find(e => e.eventId === state.eventId);
+    return ev ? ev.name : null;
+  }
+  function notify(event, message, extra, key) {
+    if (key) {
+      if (notified.has(key)) return;
+      notified.add(key);
+    }
+    if (!state.notifyOn || !ext || !ext.runtime || !ext.runtime.sendMessage) return;
+    const payload = Object.assign({ event, shop: 'tymes4', club: clubName(), match: eventName(), message }, extra || {});
+    try {
+      const p = ext.runtime.sendMessage({ type: 'notify', payload });
+      if (p && p.catch) p.catch(() => { /* background gone: skip */ });
+    } catch (e) { /* no background: skip */ }
+  }
+  function openOptions() {
+    try {
+      const p = ext.runtime.sendMessage({ type: 'open-options' });
+      if (p && p.catch) p.catch(() => { /* background gone */ });
+    } catch (e) { /* no background */ }
+  }
+  const seatList = () => (state.cart.placed || []).map(p => (p.col ? p.section.Name + ' · rij ' + p.col.RowNumber + ' stoel ' + p.col.SeatNumber
+    : p.spots + '× ' + p.section.Name) + (p.channelLabel ? ' · ' + p.channelLabel : ''));
 
   // ------------------------------------------------------------- stadium ---
   // Your home sections are kept by name per club, in extension storage (one
@@ -1556,6 +1589,11 @@
     if (state.cart.done && state.cartUntil) {
       const left = state.cartUntil - now;
       ui.chip.textContent = left > 0 ? '🎟 ' + mmss(left) : '⌛ verlopen';
+      if (left > 0 && left <= 5 * 60000) {
+        notify('cart_expiring', '⏰ Nog 5 minuten om af te rekenen' + (eventName() ? ' (' + eventName() + ')' : '') + '!', {
+          seats: seatList(), minutes_left: Math.round(left / 60000), expires_at: new Date(state.cartUntil).toISOString(), checkout_url: CART_URL,
+        }, 'exp:' + seatList().join('|'));
+      }
       if (left <= 0 && ui.panel.getAttribute('data-phase') === 'cart') render();
       if (left > 0 && now - state.cartSyncAt > 60000) { state.cartSyncAt = now; syncCartTime(); }
       return;
@@ -1642,6 +1680,7 @@
 
   async function onSaleOpen(ev) {
     log('🎉 VERKOOP OPEN voor "' + ev.Name + '"');
+    notify('sale_open', '🟢 Verkoop open: ' + ev.Name + (state.timer ? ' — de extensie zoekt.' : ''), null, 'sale:' + ev.EventId);
     beep();
     flashTitle('🎟️ IN VERKOOP');
 
@@ -1762,7 +1801,13 @@
     state.cart.done = true;
     state.cartUntil = Date.now() + 20 * 60 * 1000;
     state.cartSyncAt = Date.now();
-    syncCartTime();
+    syncCartTime().then(() => {
+      const left = Math.max(0, Math.round((state.cartUntil - Date.now()) / 60000));
+      notify('cart', '🎟 ' + state.cart.acquired + ' plaats(en) in je winkelwagen' + (eventName() ? ' (' + eventName() + ')' : '') +
+        ' · nog ' + left + ' min om af te rekenen', {
+        seats: seatList(), minutes_left: left, expires_at: new Date(state.cartUntil).toISOString(), checkout_url: CART_URL,
+      });
+    });
     stop();
     log('🎟️ ' + state.cart.acquired + ' plaats(en) staan in je winkelwagen — rond af!');
     ui.panel.classList.remove('nts-min');
@@ -1848,6 +1893,8 @@
         add('ok', state.prefs.join(', ') + ' · geldt zodra de vakken er zijn');
       }
     }
+
+    add(state.notifyOn ? 'ok' : 'info', state.notifyOn ? 'Meldingen staan aan (webhook)' : 'Meldingen staan uit (instellen onder Meer opties)');
 
     if (chan.list && chan.list.length > 1) {
       const names = chan.list.filter(c => channelInScope(c.Id)).map(channelLabel);
@@ -2284,6 +2331,7 @@
     if (state.session.wasCustomer && !customer) {
       log('🔒 Je sessie is teruggevallen naar anoniem — log opnieuw in. ' +
           '(De shop doet dit zelf zodra zijn login-check faalt.)');
+      notify('attention', '🔒 Je bent uitgelogd in de shop; log opnieuw in.');
       beep();
     }
     state.session.wasCustomer = customer;
@@ -2320,6 +2368,7 @@
       refreshTokenStatus();
     } catch (e) {
       log('⚠️ Sessie verlengen mislukt: ' + e.message);
+      notify('attention', '⚠️ Je shopsessie kon niet verlengd worden (' + e.message + '); log zo nodig opnieuw in.', null, 'renew');
     }
   }
 
@@ -2531,6 +2580,7 @@
       '    <div class="nts-sections"></div>' +
       '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label></div>' +
       '    <details class="nts-more"><summary>Meer opties</summary>' +
+      '      <div class="nts-row"><button class="nts-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
       '      <div class="nts-row nts-kindrow" style="display:none"><label>Soort <select class="nts-kind" title="In welke verkoopkanalen hij zoekt (thuiswedstrijden)">' +
       '        <option value="all">alles</option><option value="regulier">alleen regulier</option><option value="tweedekans">alleen tweedekans</option>' +
       '      </select></label></div>' +
@@ -2637,6 +2687,13 @@
     ui.pay = panel.querySelector('.nts-pay');
     ui.pay2 = panel.querySelector('.nts-pay2');
     ui.reloadCart = panel.querySelector('.nts-reload-cart');
+    panel.querySelector('.nts-notify-btn').addEventListener('click', openOptions);
+    storeGet(NOTIFY_KEY).then(url => { state.notifyOn = !!url; render(); });
+    if (ext && ext.storage && ext.storage.onChanged) {
+      ext.storage.onChanged.addListener(ch => {
+        if (ch[NOTIFY_KEY]) { state.notifyOn = !!ch[NOTIFY_KEY].newValue; render(); }
+      });
+    }
     ui.pay.addEventListener('click', () => checkout(Number(ui.pay.dataset.channel) || 0));
     ui.pay2.addEventListener('click', () => checkout(Number(ui.pay2.dataset.channel) || 0));
     panel.querySelector('.nts-reload-cart').addEventListener('click', reloadCart);

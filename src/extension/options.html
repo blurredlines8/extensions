@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seat Assist · meldingen</title>
+<style>
+  :root {
+    --bg: #ffffff; --surface: #f4f4f7; --border: #e3e3ea; --text: #1b1b22; --muted: #64646f;
+    --accent: #e2001a; --green: #16a34a; --green-bg: #e6f6ec; --green-text: #157f3a;
+    --red-bg: #fdecec; --red-text: #c0392b; --code: #f3f3f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15151a; --surface: #1e1e25; --border: #2c2c35; --text: #ececf1; --muted: #9a9aa6;
+      --green: #1f9d55; --green-bg: #12321f; --green-text: #6fe6a1;
+      --red-bg: #3a1414; --red-text: #ff9b9b; --code: #101014;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h1::before { content: ""; width: 10px; height: 10px; border-radius: 3px; background: var(--accent); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); margin: 28px 0 8px; }
+  p { margin: 6px 0; color: var(--muted); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  input {
+    width: 100%; font: inherit; padding: 9px 10px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 7px;
+  }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  button {
+    font: inherit; font-weight: 600; padding: 8px 14px; border-radius: 7px; cursor: pointer;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border);
+  }
+  button.primary { color: #fff; background: var(--green); border-color: transparent; }
+  #status { margin-top: 12px; min-height: 1.5em; }
+  #status.ok { color: var(--green-text); }
+  #status.bad { color: var(--red-text); }
+  pre {
+    margin: 8px 0 0; padding: 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.45;
+    background: var(--code); border: 1px solid var(--border); border-radius: 7px;
+  }
+  ul { margin: 6px 0; padding-left: 20px; color: var(--muted); }
+  li { margin: 2px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Seat Assist · meldingen</h1>
+  <p>Krijg een seintje als er iets gebeurt, ook als je niet achter je computer zit. De extensie stuurt een
+    bericht (JSON) naar een webhook die je zelf instelt, bijvoorbeeld in Home Assistant, dat het doorstuurt naar
+    Telegram.</p>
+
+  <h2>Webhook</h2>
+  <div class="card">
+    <label for="url">Webhook-URL</label>
+    <input id="url" type="url" placeholder="https://jouw-home-assistant/api/webhook/een-lange-geheime-id" autocomplete="off" spellcheck="false">
+    <p>De URL werkt als wachtwoord: hij blijft in je browser en komt nergens anders terecht. Bij opslaan vraagt
+      de browser toestemming om berichten naar dat ene adres te sturen.</p>
+    <div class="row">
+      <button id="save" class="primary">Opslaan</button>
+      <button id="test">Test versturen</button>
+      <button id="remove">Verwijderen</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <h2>Wanneer</h2>
+  <ul>
+    <li>🎟 stoelen in je winkelwagen (welke, en hoeveel minuten je hebt)</li>
+    <li>⏰ nog 5 minuten om af te rekenen</li>
+    <li>🟢 de verkoop is open / jouw fase begint</li>
+    <li>🚦 je bent door de wachtrij (TIXX-shops)</li>
+    <li>⚠️ er is iets dat jij moet doen: niet ingelogd, bot-check, sessie verlopen, gestopt</li>
+  </ul>
+
+  <h2>Home Assistant</h2>
+  <p>Een automatisering met een webhook-trigger; de URL is dan
+    <code>https://&lt;jouw-ha&gt;/api/webhook/&lt;webhook_id&gt;</code>.</p>
+  <pre>triggers:
+  - trigger: webhook
+    webhook_id: een-lange-geheime-id
+    allowed_methods: [POST]
+    local_only: false   # true als Home Assistant alleen thuis bereikbaar is
+actions:
+  - action: notify.telegram
+    data:
+      message: "{{ trigger.json.message }}"</pre>
+
+  <h2>Wat er verstuurd wordt</h2>
+  <pre>{
+  "event": "cart",            // cart · cart_expiring · sale_open · queue_done · attention · test
+  "shop": "tymes4",           // tymes4 (NEC, Twente, Willem II) · tixx (Köln, BvB)
+  "club": "nec-nijmegen",
+  "match": "N.E.C. - FC Groningen",
+  "seats": ["Field Seats G · rij 1 stoel 110"],
+  "minutes_left": 19,
+  "expires_at": "2026-10-22T20:31:00.000Z",
+  "checkout_url": "https://…",
+  "message": "🎟 1 stoel in je winkelwagen …",
+  "sent_at": "2026-10-22T20:12:00.000Z"
+}</pre>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

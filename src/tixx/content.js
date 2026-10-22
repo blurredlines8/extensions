@@ -101,6 +101,7 @@
     lastTry: '',           // the last attempt, in words
     cartSeats: [],         // names of the seats this run put in the cart
     cartUntil: 0,          // when the cart's hold runs out (0 = no cart phase)
+    notifyOn: false,       // a webhook is set on the options page
     want: 1,
     mode: 'row',           // row | cluster | loose
     geo: null,             // seat positions and row directions per block
@@ -192,6 +193,24 @@
     await learnStadium(state.blocks, state.venue);
     applyPrefs();
     renderBlocks();
+  }
+
+  // --------------------------------------------------------- notifications ---
+  // A webhook you set on the options page (e.g. Home Assistant → Telegram);
+  // the background sends it. `key`: send this one only once per page.
+  const NOTIFY_KEY = 'notify:webhook';
+  const notified = new Set();
+  function notify(event, message, extra, key) {
+    if (key) {
+      if (notified.has(key)) return;
+      notified.add(key);
+    }
+    if (!state.notifyOn || !ext || !ext.runtime || !ext.runtime.sendMessage) return;
+    const payload = Object.assign({ event, shop: 'tixx', club: CLUB, match: state.eventLabel || null, message }, extra || {});
+    try {
+      const p = ext.runtime.sendMessage({ type: 'notify', payload });
+      if (p && p.catch) p.catch(() => { /* background gone: skip */ });
+    } catch (e) { /* no background: skip */ }
   }
 
   // ------------------------------------------------------------- stadium ---
@@ -650,6 +669,7 @@
         }
         if (state.waitLogged) {
           log('🟢 Het stoelplan is er!');
+          notify('sale_open', '🟢 Verkoop open' + (state.eventLabel ? ': ' + state.eventLabel : '') + ' — de extensie zoekt.', null, 'sale:' + state.eventId);
           flashTitle('🟢 Open');
           beep();
           state.waitLogged = false;
@@ -733,6 +753,7 @@
     if (e && e.blocked) {
       state.blocked = true;
       stop();
+      notify('attention', '⚠️ De shop vraagt om te bevestigen dat je geen bot bent. Doe dat zelf in de browser; de extensie is gestopt.', null, 'blocked');
       log('🛑 De shop vraagt om te bevestigen dat je geen bot bent. Doe dat zelf in dit tabblad en start daarna opnieuw.');
       showBanner('De shop vraagt om een bevestiging.', 'Pagina herladen', window.location.href);
       beep();
@@ -742,6 +763,7 @@
     if (e && e.redirected) {
       stop();
       log('🛑 Shop stuurt door: ' + e.message + '. Ga in dit tabblad gewoon door de wachtrij en start daarna opnieuw.');
+      notify('attention', '⚠️ De shop stuurt door (' + e.message + '); de extensie is gestopt.', null, 'redirect');
       return;
     }
     log('⚠️ ' + nowStr() + ' ' + (e && e.message ? e.message : e));
@@ -827,6 +849,10 @@
     saveCartPhase();
     stop();
     log('🎟️ ' + state.acquired + ' plaats(en) in je winkelwagen. Je hebt 20 minuten om af te rekenen!');
+    notify('cart', '🎟 ' + state.acquired + ' plaats(en) in je winkelwagen' + (state.eventLabel ? ' (' + state.eventLabel + ')' : '') +
+      ' · nog 20 min om af te rekenen', {
+      seats: state.cartSeats, minutes_left: 20, expires_at: new Date(state.cartUntil).toISOString(), checkout_url: SHOP + '/shoppingcart',
+    });
     ui.panel.classList.remove('sat-min');
     ui.panel.querySelector('.sat-collapse').textContent = '–';
     if (dock.on) applyDock();
@@ -957,6 +983,7 @@
     if (state.loggedIn !== false || !armed || state.loginWarned) return;
     state.loginWarned = true;
     log('🔑 Je bent niet ingelogd. Zonder login zie je de ledenverkoop niet — log in vóór de wachtrij.');
+    notify('attention', '🔑 Je bent niet ingelogd in de shop; zonder login zie je de ledenverkoop niet.', null, 'login');
     showBanner('🔑 Niet ingelogd: de ledenverkoop zie je pas na inloggen.', 'Inloggen', loginUrl());
     beep();
   }
@@ -964,6 +991,13 @@
   const loginUrl = () => SHOP + '/oauth/start?target_uri=' + encodeURIComponent(window.location.href);
 
   function setRunning() { render(); }
+
+  function openOptions() {
+    try {
+      const p = ext.runtime.sendMessage({ type: 'open-options' });
+      if (p && p.catch) p.catch(() => { /* background gone */ });
+    } catch (e) { /* no background */ }
+  }
 
   function setStatus(text) {
     state.statusText = text;
@@ -1120,6 +1154,9 @@
     const st = saleStart();
     if (st) add('ok', 'Verkoopstart ' + fmtClock(st.at) + ' (' + st.from + ')');
     else add('info', 'Verkoopstart onbekend: vul hem in, dan kijkt hij rond de start elke 5 s');
+
+    add(state.notifyOn ? 'ok' : 'info', state.notifyOn ? 'Meldingen staan aan (webhook)' : 'Meldingen staan uit',
+      state.notifyOn ? null : { label: 'Instellen', on: openOptions });
 
     if (state.group) {
       const v = state.groupView;
@@ -1541,6 +1578,12 @@
     const ph = phase();
     renderPhase(ph);
     renderChip(ph);
+    if (ph === 'cart' && state.cartUntil - Date.now() <= 5 * 60000) {
+      notify('cart_expiring', '⏰ Nog 5 minuten om af te rekenen' + (state.eventLabel ? ' (' + state.eventLabel + ')' : '') + '!', {
+        seats: state.cartSeats, minutes_left: Math.max(0, Math.round((state.cartUntil - Date.now()) / 60000)),
+        expires_at: new Date(state.cartUntil).toISOString(), checkout_url: SHOP + '/shoppingcart',
+      }, 'exp:' + state.cartSeats.join('|'));
+    }
     // Keep the cart's countdown on the shop's clock, not just ours.
     if (ph === 'cart' && Date.now() - (state.cartSyncAt || 0) > 60000) {
       state.cartSyncAt = Date.now();
@@ -1740,6 +1783,7 @@
       '      <label>Soort <select class="sat-kind" title="Welke plaatsen tellen mee">' +
       '        <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +
       '      </select></label></div>' +
+      '      <div class="sat-row"><button class="sat-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
       '      <div class="sat-row"><input type="text" class="sat-armmatch" placeholder="Auto-start: wedstrijd waarvan de naam … bevat" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
       '      <div class="sat-row"><button class="sat-reload-more" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad winkelwagen</button>' +
       '        <button class="sat-clear sat-clear-more" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
@@ -1818,6 +1862,7 @@
     panel.querySelector('.sat-clear-more').addEventListener('click', clearCart);
     panel.querySelector('.sat-reload-cart').addEventListener('click', reloadCart);
     panel.querySelector('.sat-reload-more').addEventListener('click', reloadCart);
+    panel.querySelector('.sat-notify-btn').addEventListener('click', openOptions);
     panel.querySelector('.sat-collapse').addEventListener('click', (e) => {
       panel.classList.toggle('sat-min');
       e.target.textContent = panel.classList.contains('sat-min') ? '+' : '–';
@@ -1888,6 +1933,24 @@
 
     // The stadium and your blocks live in extension storage (shared by all
     // containers); wait for them before resuming or registering the group.
+    storeGet(NOTIFY_KEY).then(url => {
+      state.notifyOn = !!url;
+      render();
+      // Back on the shop after this tab went into the queue by itself.
+      let at = 0;
+      try { at = Number(window.sessionStorage.getItem(QUEUE_AT_KEY)) || 0; } catch (e) { /* none */ }
+      let done = 0;
+      try { done = Number(window.sessionStorage.getItem(QUEUE_AT_KEY + ':done')) || 0; } catch (e) { /* none */ }
+      if (at && at !== done && Date.now() - at < 3 * 3600e3) {
+        try { window.sessionStorage.setItem(QUEUE_AT_KEY + ':done', String(at)); } catch (e) { /* once per page then */ }
+        notify('queue_done', '🚦 Door de wachtrij' + (state.eventLabel ? ' (' + state.eventLabel + ')' : '') + ' — de extensie zoekt verder.');
+      }
+    });
+    if (ext && ext.storage && ext.storage.onChanged) {
+      ext.storage.onChanged.addListener(ch => {
+        if (ch[NOTIFY_KEY]) { state.notifyOn = !!ch[NOTIFY_KEY].newValue; render(); }
+      });
+    }
     Promise.all([storeGet(STADIUM_KEY), storeGet(PREFS_KEY)]).then(([stadium, prefs]) => {
       state.stadium = stadium && Array.isArray(stadium.blocks) ? stadium : null;
       state.prefs = Array.isArray(prefs) ? prefs : [];

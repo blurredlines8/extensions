@@ -31,6 +31,10 @@ FILES=(
   "tixx/content.js:tixx-content.js"
   "tixx/background.js:tixx-background.js"
   "tixx/styles.css:tixx.css"
+  "extension/background.js:background.js"
+  "extension/notify.js:notify.js"
+  "extension/options.html:options.html"
+  "extension/options.js:options.js"
 )
 OUT=()
 for pair in "${FILES[@]}"; do OUT+=("${pair#*:}"); done

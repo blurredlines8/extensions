@@ -11,8 +11,13 @@
     "__TIXX_API_ORIGIN__/*",
     "__TIXX_SHOP_ORIGIN__/*"
   ],
+  "optional_host_permissions": ["*://*/*"],
   "background": {
-    "service_worker": "tixx-background.js"
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "content_scripts": [
     {

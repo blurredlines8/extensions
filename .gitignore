@@ -5,7 +5,9 @@
 # met de shop-URL's uit .env ingevuld. Hoort niet in de repo.
 firefox-extension/*.js
 firefox-extension/*.css
+firefox-extension/*.html
 firefox-extension/manifest.json
+chrome-extension/*.html
 chrome-extension/*.js
 chrome-extension/*.css
 chrome-extension/manifest.json
