@@ -331,6 +331,151 @@
     return [];
   }
 
+  // -------------------------------------------------------------- groups ---
+
+  // Several accounts (one per Firefox container) buy for one group that wants
+  // to sit together. A seat only counts as held once it is in some account's
+  // cart, and each account may hold just a few, so nobody can hold seats for
+  // the others. Instead the first account through picks a spot with room for
+  // the whole group and takes its share at one end; every later account takes
+  // seats right next to, or directly behind, what the group already holds.
+
+  // Free seats a pick would leave alone between taken ones (the shop refuses
+  // picks that do: "ungenutzter Anschlussplatz").
+  function strandedBy(free, picked) {
+    const taken = new Set(picked);
+    const isFree = id => free.has(id) && !taken.has(id);
+    const lone = new Set();
+    for (const p of picked) {
+      for (const n of [p - 1, p + 1]) {
+        if (isFree(n) && !isFree(n - 1) && !isFree(n + 1)) lone.add(n);
+      }
+    }
+    return lone.size;
+  }
+
+  // `mine` adjacent seats at one end of a row of the spot, so what is left of
+  // the spot stays together for the next account.
+  function shareOf(spot, mine, free, geo) {
+    // Per row the stretches of adjacent seats (a seat taken by a stranger
+    // splits a row of the spot in two).
+    const runs = [...runsByRow(spot).values()].flat();
+    let best = null;
+    for (const seats of runs) {
+      seats.sort((a, b) => alongRow(a, geo) - alongRow(b, geo));
+      if (seats.length < mine) continue;
+      for (const w of [seats.slice(0, mine), seats.slice(-mine)]) {
+        // A single spot seat left in this row would need a buyer of one.
+        const cost = strandedBy(free, w) * 20 + (seats.length - mine === 1 ? 5 : 0) - seats.length * 0.1;
+        if (!best || cost < best.cost) best = { cost, seats: w };
+      }
+    }
+    if (best) return best.seats;
+    return spot.slice().sort((a, b) => rowIdxOf(a) - rowIdxOf(b) || alongRow(a, geo) - alongRow(b, geo)).slice(0, mine);
+  }
+
+  // First account: find room for `total` seats over at most two rows (fewer
+  // if the group does not fit anywhere) and return this account's share.
+  function groupStart(freeIds, opts) {
+    const mine = Math.max(1, opts.mine || 1);
+    const free = new Set(freeIds);
+    for (let n = Math.max(mine, opts.total || mine); n >= mine; n--) {
+      const spot = pickSeats(freeIds, {
+        want: n, mode: 'cluster', maxRows: opts.maxRows || 2,
+        blocks: opts.blocks, geo: opts.geo, accept: opts.accept, skip: opts.skip,
+      });
+      if (spot.length === n) return { seats: shareOf(spot, mine, free, opts.geo), room: n, plan: spot };
+    }
+    return null;
+  }
+
+  // Seats' worth of distance from some seats to the group: 0 when, row by
+  // row, they touch the group's seats in that row or, in a row the group
+  // does not use yet, sit right behind or in front of them. Infinity when
+  // there is no group seat in that row or the rows next to it.
+  function gapToGroup(seats, group, geo) {
+    let worst = 0;
+    const rows = new Map();
+    for (const id of seats) {
+      const k = blockOf(id) * 1e3 + rowIdxOf(id);
+      if (!rows.has(k)) rows.set(k, []);
+      rows.get(k).push(id);
+    }
+    for (const w of rows.values()) {
+      const block = blockOf(w[0]), r = rowIdxOf(w[0]);
+      const inBlock = group.filter(h => blockOf(h) === block);
+      const same = inBlock.filter(h => rowIdxOf(h) === r);
+      const ref = same.length ? same : inBlock.filter(h => Math.abs(rowIdxOf(h) - r) === 1);
+      if (!ref.length) return Infinity;
+      const t = ref.map(h => alongRow(h, geo)), wt = w.map(id => alongRow(id, geo));
+      const gap = Math.max(0, Math.round(Math.max(Math.min(...wt) - Math.max(...t), Math.min(...t) - Math.max(...wt))) - 1);
+      worst = Math.max(worst, gap);
+    }
+    return worst;
+  }
+
+  // Later account: first its share of the spot the first account planned
+  // (`opts.plan`, all seats of it), taken at an end so the rest stays whole.
+  // When strangers took seats from the plan: the best touching stretch
+  // within what is left of it, then anywhere in the group's block, keeping
+  // the whole group within `maxRows` consecutive rows. Returns the closest
+  // stretch even when it does not touch (`gap` > 0), so the caller can say
+  // how far off it is.
+  function groupJoin(freeIds, held, opts) {
+    const mine = Math.max(1, opts.mine || 1);
+    const maxRows = opts.maxRows || 2;
+    const geo = opts.geo;
+    const skip = opts.skip || new Set();
+    const heldSet = new Set(held);
+    const free = new Set([...freeIds].filter(id => !heldSet.has(id)));
+    const ok = id => !skip.has(id) && (!opts.accept || opts.accept(id));
+
+    const search = cands => {
+      const perBlock = new Map();
+      for (const h of held) perBlock.set(blockOf(h), (perBlock.get(blockOf(h)) || 0) + 1);
+      let best = null;
+      for (const [block] of [...perBlock].sort((x, y) => y[1] - x[1])) {
+        const group = held.filter(h => blockOf(h) === block);
+        const groupRows = group.map(rowIdxOf);
+        const rMin = Math.min(...groupRows), rMax = Math.max(...groupRows);
+        const t = group.map(h => alongRow(h, geo));
+        const gMid = t.reduce((x, y) => x + y, 0) / t.length;
+        const rows = runsByRow([...cands].filter(id => blockOf(id) === block));
+        for (const [r, runs] of rows) {
+          const span = Math.max(rMax, r) - Math.min(rMin, r) + 1;
+          if (span > maxRows) continue;
+          for (const run of runs) {
+            for (let i = 0; i + mine <= run.length; i++) {
+              const w = run.slice(i, i + mine);
+              const gap = gapToGroup(w, group, geo);
+              if (gap === Infinity) continue;
+              const wt = w.map(id => alongRow(id, geo));
+              const mid = (Math.min(...wt) + Math.max(...wt)) / 2;
+              const cost = gap * 10 + (span - 1) * 2 + (groupRows.includes(r) ? 0 : 1) +
+                strandedBy(free, w) * 20 + Math.abs(mid - gMid) * 0.1;
+              if (!best || cost < best.cost) best = { cost, seats: w, gap };
+            }
+          }
+        }
+      }
+      return best;
+    };
+
+    if (opts.plan && opts.plan.length) {
+      const rest = opts.plan.filter(id => free.has(id) && ok(id));
+      if (rest.length >= mine) {
+        const share = shareOf(rest, mine, free, geo);
+        // Adjacent within each row: no stranger's seat inside our own share.
+        const whole = [...runsByRow(share).values()].every(runs => runs.length === 1);
+        if (whole && gapToGroup(share, held, geo) === 0) return { seats: share, gap: 0, planned: true };
+        const inPlan = search(new Set(rest));
+        if (inPlan && inPlan.gap === 0) return { seats: inPlan.seats, gap: 0, planned: true };
+      }
+    }
+    const best = search(new Set([...free].filter(ok)));
+    return best ? { seats: best.seats, gap: best.gap } : null;
+  }
+
   // Ticket limits from the venue page: most regular blocks are "marked" with
   // a lower per-order maximum than the rest of the stadium.
   function parseLimits(html) {
@@ -453,6 +598,7 @@
     decodeAvailability, decodeMapping, isResaleCategory,
     parseVenuePage, standOf, blocksFromSeatmap, seatLabels, seatGeometry,
     parseSeatCard, parseCart, pickSeats, parseLimits, blockLimit, saleBlocks,
+    groupStart, groupJoin, strandedBy,
     parseSchedule, parseSaleCell, dateKey, parseQueue,
   };
   if (typeof module === 'object' && module.exports) module.exports = api;
