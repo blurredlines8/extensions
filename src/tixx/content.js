@@ -372,7 +372,7 @@
     return state.kind === 'resale' ? resale : !resale;
   }
 
-  const MODE_TEXT = { row: 'in één rij', cluster: 'cluster', loose: 'los' };
+  const MODE_TEXT = { row: 'in één rij', cluster: 'cluster', block: 'zelfde vak', loose: 'los' };
 
   function markTried(id) { state.attempted.set(id, Date.now()); }
   // Seats tried within RETRY_MS; older ones are forgotten and may be tried again.
@@ -500,7 +500,23 @@
     const anchor = v.held.concat(state.cart || []);
     let pick = null;
     let plan = null;
-    if (!anchor.length) {
+    if (state.mode === 'block') {
+      // "Zelfde vak": one block for the whole group, any seats in it.
+      if (!anchor.length) {
+        const r = core.groupBlockStart(candidates, Object.assign({ total: Math.max(need, v.total), blocks: eligibleBlocks() }, opts));
+        if (!r) { groupOnce('noblock', '👥 Nog geen vak met plek voor alle ' + v.total + ' (zelfde vak); ik wacht.'); return []; }
+        pick = r.seats;
+      } else {
+        const sale = core.saleBlocks(state.venue);
+        const pool = [...state.free].filter(id => !sale || sale.has(core.blockOf(id)));
+        const r = core.groupBlockJoin(pool, anchor, opts);
+        if (!r.seats) {
+          groupOnce('blockfull' + r.free, '👥 In ' + blockName(r.block) + ' (het vak van de groep) is nu niet genoeg vrij (' + r.free + '); ik wacht.');
+          return [];
+        }
+        pick = r.seats;
+      }
+    } else if (!anchor.length) {
       const r = core.groupStart(candidates, Object.assign({ total: Math.max(need, v.total), blocks: eligibleBlocks() }, opts));
       if (!r) { groupOnce('noroom', '👥 Nog geen plek voor de groep in de gekozen blokken.'); return []; }
       if (r.room < v.total) groupOnce('small' + r.room, '👥 Geen plek voor alle ' + v.total + ' samen; wel voor ' + r.room + '. Daar begin ik.');
@@ -1179,6 +1195,8 @@
       else add('warn', 'Nu is geen van je vakken te koop (' + off.join(', ') + '); ik blijf ze bewaken');
     }
 
+    if (state.mode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de stoel zelf maakt niet uit' + (state.group ? ' (voor de hele groep)' : ''));
+
     const limits = state.venue && state.venue.limits;
     const held = state.cart ? state.cart.length : 0;
     const n = state.want + ' kaart' + (state.want === 1 ? '' : 'en');
@@ -1819,8 +1837,9 @@
       '      <input type="checkbox" class="sat-group"> Samen zitten met andere accounts</label></div>' +
       '    <div class="sat-sales"></div>' +
       '    <details class="sat-more"><summary>Meer opties</summary>' +
-      '      <div class="sat-row"><label>Stoelen <select class="sat-mode" title="Hoe de stoelen bij elkaar moeten liggen (niet bij samen zitten)">' +
-      '        <option value="row">naast elkaar in één rij</option><option value="cluster">cluster (max 3 rijen)</option><option value="loose">los</option>' +
+      '      <div class="sat-row"><label>Stoelen <select class="sat-mode" title="Hoe de stoelen bij elkaar moeten liggen. Samen zitten: naast elkaar, of met \'zelfde vak\' alles in één vak">' +
+      '        <option value="row">naast elkaar in één rij</option><option value="cluster">cluster (max 3 rijen)</option>' +
+      '        <option value="block">zelfde vak (plek maakt niet uit)</option><option value="loose">los</option>' +
       '      </select></label>' +
       '      <label>Soort <select class="sat-kind" title="Welke plaatsen tellen mee">' +
       '        <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +

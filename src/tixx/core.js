@@ -318,10 +318,23 @@
     return best ? best.seats : null;
   }
 
+  // `want` seats anywhere in one block, but as compact as the block allows:
+  // first a group over few rows (fewer stray seats left, and the shop refuses
+  // picks that strand a lone seat), else simply the first free ones.
+  function anyInBlock(ids, want, geo) {
+    if (ids.length < want) return null;
+    for (const rows of [1, 2, 3, 6]) {
+      const got = clusterInBlock(ids, want, rows, geo);
+      if (got) return got;
+    }
+    return ids.slice().sort((a, b) => a - b).slice(0, want);
+  }
+
   // Pick `want` seats from the free ones. Blocks are tried in priority order
   // (empty = every block); the first block that can serve the request wins.
   //   mode 'row'     — adjacent seats in one row
   //   mode 'cluster' — a compact group over up to `maxRows` consecutive rows
+  //   mode 'block'   — any seats, all in one block ("zelfde vak")
   //   mode 'loose'   — the first free seats, across blocks
   function pickSeats(freeIds, opts) {
     const want = Math.max(1, opts.want || 1);
@@ -331,6 +344,13 @@
     const order = opts.blocks && opts.blocks.length ? opts.blocks : [...new Set(ids.map(blockOf))];
     const byBlock = block => ids.filter(id => blockOf(id) === block).sort((a, b) => a - b);
     if (mode === 'loose' || want === 1) return order.flatMap(byBlock).slice(0, want);
+    if (mode === 'block') {
+      for (const block of order) {
+        const got = anyInBlock(byBlock(block), want, opts.geo);
+        if (got) return got;
+      }
+      return [];
+    }
     const maxRows = mode === 'cluster' ? Math.max(1, opts.maxRows || 3) : 1;
     for (const block of order) {
       const got = clusterInBlock(byBlock(block), want, maxRows, opts.geo);
@@ -484,6 +504,36 @@
     return best ? { seats: best.seats, gap: best.gap } : null;
   }
 
+  // "Zelfde vak" for a group: the first account picks the first block (in
+  // your order) with room for the whole group and takes its share there; the
+  // others take any free seats in the block the group holds. Fewer than
+  // needed there → nothing (wait), never another block.
+  function groupBlockStart(freeIds, opts) {
+    const mine = Math.max(1, opts.mine || 1);
+    const total = Math.max(mine, opts.total || mine);
+    const skip = opts.skip || new Set();
+    const ids = [...freeIds].filter(id => !skip.has(id) && (!opts.accept || opts.accept(id)));
+    const order = opts.blocks && opts.blocks.length ? opts.blocks : [...new Set(ids.map(blockOf))];
+    for (const block of order) {
+      const inBlock = ids.filter(id => blockOf(id) === block);
+      if (inBlock.length < total) continue;
+      return { seats: anyInBlock(inBlock, mine, opts.geo), room: total, block };
+    }
+    return null;
+  }
+
+  function groupBlockJoin(freeIds, held, opts) {
+    const mine = Math.max(1, opts.mine || 1);
+    const skip = opts.skip || new Set();
+    const heldSet = new Set(held);
+    const counts = new Map();
+    for (const h of held) counts.set(blockOf(h), (counts.get(blockOf(h)) || 0) + 1);
+    const block = [...counts].sort((a, b) => b[1] - a[1])[0][0];
+    const ids = [...freeIds].filter(id => blockOf(id) === block && !heldSet.has(id) && !skip.has(id) && (!opts.accept || opts.accept(id)));
+    const seats = anyInBlock(ids, mine, opts.geo);
+    return { seats, block, free: ids.length };
+  }
+
   // Ticket limits from the venue page: most regular blocks are "marked" with
   // a lower per-order maximum than the rest of the stadium.
   function parseLimits(html) {
@@ -606,7 +656,7 @@
     decodeAvailability, decodeMapping, isResaleCategory,
     parseVenuePage, standOf, blocksFromSeatmap, seatLabels, seatGeometry,
     parseSeatCard, parseCart, pickSeats, parseLimits, blockLimit, saleBlocks,
-    groupStart, groupJoin, strandedBy,
+    groupStart, groupJoin, strandedBy, groupBlockStart, groupBlockJoin, anyInBlock,
     parseSchedule, parseSaleCell, dateKey, parseQueue,
   };
   if (typeof module === 'object' && module.exports) module.exports = api;

@@ -28,6 +28,7 @@
   const RUN_KEY = 'ntsRun';
   const EVENT_KEY = 'ntsEvent';
   const LOG_MAX = 300;
+  const PLACE_KEY = 'ntsPlaceMode';
 
   const state = {
     events: [],
@@ -42,6 +43,7 @@
     notifyOn: false,       // a webhook is set on the options page
     quietSince: 0,         // since when nothing has been free in your sections (0 = something is)
     channelKind: 'all',    // home matches: 'all' | 'regulier' | 'tweedekans'
+    placeMode: 'first',    // home matches: 'first' (first free, any of your sections) | 'block' (all in one section)
     note: '',              // one short line under it (away/placement cases)
     freeAll: null,         // free seats in the whole stadium at the last look
     cartSyncAt: 0,
@@ -75,6 +77,7 @@
       acquired: 0, attempted: new Set(), done: false,
       seatTried: new Map(),   // home seats: key -> when it failed (retry after RETRY_MS)
       channel: null,          // the sales channel this cart (order) belongs to
+      blockName: null,        // "zelfde vak": the section the first seats went to
     },
   };
 
@@ -545,6 +548,7 @@
     try {
       window.sessionStorage.setItem(CART_CTX_KEY, JSON.stringify({
         cartChannel: state.cart.channel || null,
+        blockName: state.cart.blockName || null,
         eventId: state.eventId,
         eventCategory: state.eventCategory,
         orderId: state.cart.orderId,
@@ -570,6 +574,7 @@
       state.cart.orderId = c.orderId || null;
       state.cart.orderUID = c.orderUID || null;
       state.cart.channel = c.cartChannel || null;
+      state.cart.blockName = c.blockName || null;
       state.cart.placed = Array.isArray(c.placed) ? c.placed : [];
       state.cart.acquired = state.cart.placed.length;
       if (state.cart.placed.length) {
@@ -735,6 +740,24 @@
     }
   }
 
+  // "Zelfde vak": any place in one section will do, but all in that section.
+  // Before the first seats: only the first section (in your order) with room
+  // for everything still wanted; after: only the section they went to. Other
+  // modes: the list as it is.
+  function sameSection(list, nameOf, roomOf) {
+    if (state.placeMode !== 'block') return list;
+    const lock = state.cart.blockName;
+    if (lock) return list.filter(x => nameOf(x) === lock);
+    const need = state.wantedCount - state.cart.acquired;
+    const fit = list.find(x => roomOf(x) >= need);
+    if (!fit && list.some(x => roomOf(x) > 0) && !state.sameNoted) {
+      state.sameNoted = true;
+      log('👥 Zelfde vak: nog geen vak met plek voor alle ' + need + '; ik wacht tot er een is.');
+    }
+    if (fit) state.sameNoted = false;
+    return fit ? [fit] : [];
+  }
+
   // Seats of one match in the carts we know (this page's and other channels').
   async function seatsInCarts(eventId) {
     const orders = [];
@@ -844,14 +867,18 @@
         secs = secs.filter(x => prio.has(x.VenueBuildingBlockId))
           .sort((a, b) => prio.get(a.VenueBuildingBlockId) - prio.get(b.VenueBuildingBlockId));
       }
+      const found = [];
       for (const section of secs) {
-        if (state.cart.done) break;
         const detail = await getSection(section.VenueBuildingBlockId, state.eventId, tok);
         if (isUnplacedDetail(detail)) continue;   // spots without seat numbers: not in this pass
         const seats = detail.Rows.flatMap(r => r.Columns)
           .filter(col => isSeat(col) && (col.IsAvailableForSale === true || col.AvailableForSecondary === true));
         extra += seats.length;
-        if (seats.length) await claimSeats(section, seats, ch);
+        if (seats.length) found.push({ section, seats });
+      }
+      for (const f of sameSection(found, x => x.section.Name, x => x.seats.length)) {
+        if (state.cart.done) break;
+        await claimSeats(f.section, f.seats, ch);
       }
     }
     if (extra && state.hunt) status(state.note, { free: state.hunt.free + extra, unit: state.hunt.unit + ' · ' + extra + ' via tweedekans' });
@@ -1135,8 +1162,12 @@
       // Home matches look in every sales channel you chose; away matches
       // stay exactly as before (page channel only).
       const home = isHomeVenue(venue.Sections);
+      // Room in a section: its free seats; for standing room the number of
+      // spots (unknown counts as "try it").
+      const room = g => ('spots' in g ? (g.spots == null ? Infinity : g.spots) : g.seats.length);
+      const todo = home ? sameSection(gathered, g => g.section.Name, room) : gathered;
       if (!home || channelInScope(pageChannel())) {
-        for (const g of gathered) {
+        for (const g of todo) {
           if (state.cart.done) break;
           if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
           if (g.spots !== 0) await claimSpots(g.section, g.spots);
@@ -1259,6 +1290,7 @@
       log('  · vastgehouden, in winkelwagen plaatsen…');
       if (!await placeInOrder(ch)) continue;
       state.cart.placed.push(ch ? { section, col, channel: ch.id, channelLabel: ch.label } : { section, col });
+      if (state.placeMode === 'block' && !state.cart.blockName) state.cart.blockName = section.Name;
       state.cart.acquired++;
       persistCart();
       log('  ✓ In winkelwagen: ' + section.Name + ' rij ' + col.RowNumber + ' stoel ' + col.SeatNumber +
@@ -1274,7 +1306,10 @@
   async function claimSpots(section, available) {
     if (state.cart.done) return;
     const key = 'vak:' + section.VenueBuildingBlockId;
-    if (state.cart.attempted.has(key)) return;
+    if (state.homeNow) {
+      const at = state.cart.seatTried.get(key);
+      if (at && Date.now() - at < RETRY_MS) return;
+    } else if (state.cart.attempted.has(key)) return;
 
     let wanted = state.wantedCount - state.cart.acquired;
     // Never ask for more than the purchase right allows; the API refuses the
@@ -1305,11 +1340,16 @@
       }
       break;
     }
-    if (!got) { state.cart.attempted.add(key); return; }
+    if (!got) {
+      if (state.homeNow) state.cart.seatTried.set(key, Date.now());
+      else state.cart.attempted.add(key);
+      return;
+    }
 
     log('  · ' + got + ' vastgehouden, in winkelwagen plaatsen…');
     if (!await placeInOrder()) return;
     state.cart.placed.push({ section, spots: got });
+    if (state.placeMode === 'block' && state.homeNow && !state.cart.blockName) state.cart.blockName = section.Name;
     state.cart.acquired += got;
     persistCart();
     log('  ✓ In winkelwagen: ' + got + ' plek(ken) in ' + section.Name +
@@ -1767,7 +1807,7 @@
       orderId: order.PendingOrderId || null, orderUID: order.PendingOrderUID || null,
       placed: [],
       acquired: 0, attempted: new Set(), done: false,
-      seatTried: new Map(), channel: pageChannel(),
+      seatTried: new Map(), channel: pageChannel(), blockName: null,
     };
     persistCart();
     // Seats of this match already in a cart count towards what you want, like
@@ -1964,6 +2004,8 @@
       const names = chan.list.filter(c => channelInScope(c.Id)).map(channelLabel);
       add('info', 'Zoekt in: ' + names.join(' en ') + ' (thuiswedstrijden)');
     }
+
+    if (state.placeMode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de plek zelf maakt niet uit (ook staanplaatsen)');
 
     const r = state.right;
     const n = state.wantedCount + ' kaart' + (state.wantedCount === 1 ? '' : 'en');
@@ -2666,6 +2708,9 @@
       '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label></div>' +
       '    <details class="nts-more"><summary>Meer opties</summary>' +
       '      <div class="nts-row"><button class="nts-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
+      '      <div class="nts-row"><label>Plaatsen <select class="nts-place" title="Thuiswedstrijden: waar de plekken mogen liggen">' +
+      '        <option value="first">eerste vrije in mijn vakken</option><option value="block">zelfde vak (plek maakt niet uit)</option>' +
+      '      </select></label></div>' +
       '      <div class="nts-row nts-kindrow" style="display:none"><label>Soort <select class="nts-kind" title="In welke verkoopkanalen hij zoekt (thuiswedstrijden)">' +
       '        <option value="all">alles</option><option value="regulier">alleen regulier</option><option value="tweedekans">alleen tweedekans</option>' +
       '      </select></label></div>' +
@@ -2757,6 +2802,14 @@
     panel.querySelector('.nts-edit').addEventListener('click', stop);
     ui.reloadBtn.addEventListener('click', reloadCart);
     ui.clearBtn.addEventListener('click', clearCart);
+    ui.place = panel.querySelector('.nts-place');
+    try { const m = window.localStorage.getItem(PLACE_KEY); if (m === 'first' || m === 'block') state.placeMode = m; } catch (e) { /* default */ }
+    ui.place.value = state.placeMode;
+    ui.place.addEventListener('change', () => {
+      state.placeMode = ui.place.value;
+      try { window.localStorage.setItem(PLACE_KEY, state.placeMode); } catch (e) { /* not kept */ }
+      render();
+    });
     ui.kind = panel.querySelector('.nts-kind');
     try { const k = window.localStorage.getItem(CHANNEL_KEY); if (['all', 'regulier', 'tweedekans'].includes(k)) state.channelKind = k; } catch (e) { /* default */ }
     ui.kind.value = state.channelKind;
