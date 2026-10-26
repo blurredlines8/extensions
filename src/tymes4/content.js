@@ -268,19 +268,35 @@
   // How long the token has been stale. The page normally refreshes well before
   // expiry, so anything beyond a minute means its loop has stopped.
   const staleFor = q => (q && q.expires ? Math.floor(Date.now() / 1000 - q.expires) : null);
+  // The shop leaves the queue token in localStorage after a queue is over, so
+  // an expired token alone means nothing. It is "stuck" only if this page saw
+  // it fresh and then the refresh stopped, or it is a real queue place
+  // (QUEUED / being let through) that expired recently.
+  const ACTIVE_QUEUE = new Set(['QUEUED', 'WAITING_FOR_OUTFLOW']);
+  function queueStuck(q) {
+    const over = staleFor(q);
+    if (over === null || over <= 60) return false;
+    return state.queue.seenFresh || (ACTIVE_QUEUE.has(q.status) && over < 30 * 60);
+  }
 
   function reportQueueChanges() {
     const q = readQueue();
     const prev = state.queue.prev;
     state.queue.prev = q;
 
-    if (!prev && q) { log('🚦 Wachtrij: ' + queueWord(q) + (q.requeue ? ' · opnieuw aansluiten bij vertrek' : '')); return; }
+    if (!prev && q) {
+      if (!q.stale) state.queue.seenFresh = true;
+      // An old token from an earlier queue: not worth a line.
+      if (!q.stale || ACTIVE_QUEUE.has(q.status)) log('🚦 Wachtrij: ' + queueWord(q) + (q.requeue ? ' · opnieuw aansluiten bij vertrek' : ''));
+      return;
+    }
     if (prev && !q) {
       log('🚨 Je wachtrij-token is weg — je staat niet meer in de rij.');
       beep(); flashTitle('🚨 UIT DE RIJ');
       return;
     }
     if (!q) return;
+    if (!q.stale) state.queue.seenFresh = true;
 
     if (prev.status !== q.status) {
       log('🚦 Wachtrij: ' + queueWord(prev) + ' → ' + queueWord(q));
@@ -296,7 +312,7 @@
 
     // The page's own refresh has clearly stopped.
     const over = staleFor(q);
-    if (over !== null && over > 60) {
+    if (queueStuck(q)) {
       if (!state.queue.staleWarned) {
         state.queue.staleWarned = true;
         log('⚠️ Wachtrij-token is ' + fmtDuration(over * 1000) + ' verlopen — de shop ververst niet meer. ' +
@@ -306,6 +322,7 @@
         if (state.queue.autoReload && state.queue.reloads < 3) {
           state.queue.reloads++;
           log('🔄 Pagina verversen (' + state.queue.reloads + '/3) — de shop pakt je token weer op.');
+          diagMark('queueReload');
           setTimeout(() => window.location.reload(), 1500);
         }
       }
@@ -824,6 +841,7 @@
     const have = chan.tokens.get(id);
     const page = decodeJwt(getToken() || '');
     if (have && have.exp - Date.now() > 3600e3 && page && have.customerId === page.customerId) return have.token;
+    diagMark('channelToken');
     const res = await fetch(API + '/v2/Account/token/channel/' + id, { credentials: 'omit', headers: headers() });
     if (!res.ok) throw new Error('token/channel/' + id + ' HTTP ' + res.status);
     const data = await res.json();
@@ -894,16 +912,39 @@
   async function checkout(channelId) {
     const target = channelId || state.cart.channel || pageChannel();
     const o = orderOf(target);
+    const switching = target !== pageChannel();
     try {
-      if (target !== pageChannel()) {
+      if (switching) {
         const tok = await channelToken(target);
         window.sessionStorage.setItem('jwt', tok);
       }
       if (o && o.orderId) {
         window.sessionStorage.setItem('shoppingCartData', JSON.stringify({ PendingOrderId: o.orderId, PendingOrderUID: o.orderUID }));
       }
+      if (switching) diagMark('checkout');
     } catch (e) { log('⚠️ Kon niet naar dat verkoopkanaal wisselen (' + e.message + '); ik open de winkelwagen zoals hij is.'); }
     window.location.href = CART_URL;
+  }
+
+  // Moments that could matter when the session falls back to anonymous; the
+  // log line at that moment lists them, so a pattern shows over time. Kept per
+  // tab across page loads.
+  const DIAG_KEY = 'ntsDiag';
+  function diagMark(what) {
+    try {
+      const d = JSON.parse(window.sessionStorage.getItem(DIAG_KEY) || '{}');
+      d[what] = Date.now();
+      window.sessionStorage.setItem(DIAG_KEY, JSON.stringify(d));
+    } catch (e) { /* no trail then */ }
+  }
+  function diagText() {
+    const names = { channelToken: 'tweedekans-token opgehaald', renew: 'sessie verlengd', queueReload: 'pagina ververst (wachtrij)', checkout: 'van kanaal gewisseld (afrekenen)', pageLoad: 'pagina geladen' };
+    try {
+      const d = JSON.parse(window.sessionStorage.getItem(DIAG_KEY) || '{}');
+      const parts = Object.keys(d).filter(k => names[k]).sort((a, b) => d[b] - d[a])
+        .map(k => names[k] + ' ' + (fmtDuration(Date.now() - d[k]) || '0s') + ' geleden');
+      return parts.length ? parts.join(' · ') : 'geen';
+    } catch (e) { return 'onbekend'; }
   }
 
   // What the search card shows: a figure (free seats, spots or away sections)
@@ -1976,7 +2017,7 @@
       add('bad', 'Geen geldige login gevonden: log in');
     }
     const q = readQueue();
-    if (q && q.stale) add('warn', 'Je wachtrij-token is verlopen: ververs de pagina (of zet "herstel wachtrij" aan)');
+    if (queueStuck(q)) add('warn', 'De wachtrij van de shop zit vast: ververs de pagina (of zet "herstel wachtrij" aan)');
 
     const ev = state.events.find(e => e.eventId === state.eventId);
     if (state.eventId == null) add('bad', 'Nog geen wedstrijd gekozen');
@@ -2458,6 +2499,7 @@
     if (state.session.wasCustomer && !customer) {
       log('🔒 Je sessie is teruggevallen naar anoniem — log opnieuw in. ' +
           '(De shop doet dit zelf zodra zijn login-check faalt.)');
+      log('🔎 Kort daarvoor: ' + diagText() + '.');
       notify('attention', '🔒 Je bent uitgelogd in de shop; log opnieuw in.');
       beep();
     }
@@ -2492,6 +2534,7 @@
         if (res.ok) window.sessionStorage.setItem('userData', JSON.stringify(await res.json()));
       } catch (e) { /* the jwt is renewed regardless */ }
       log('🔄 Sessie verlengd tot ' + fmtLocal(new Date(fc.exp * 1000)));
+      diagMark('renew');
       refreshTokenStatus();
     } catch (e) {
       log('⚠️ Sessie verlengen mislukt: ' + e.message);
@@ -2900,6 +2943,7 @@
       log('⚠️ De extensie is bijgewerkt; ververs dit tabblad.');
     }, 30000);
 
+    diagMark('pageLoad');
     // Load the match list, bring back the chosen match, and resume a search
     // that was running in this tab before the page loaded.
     loadEvents().then(restoreSelection);
