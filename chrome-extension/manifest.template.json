@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Seat Assist (persoonlijk)",
-  "version": "1.2.11",
+  "version": "1.2.12",
   "description": "Monitort voorkeursvakken in Tymes4- en TIXX-ticketshops en zet zodra mogelijk een stoel in je winkelwagen. Draait binnen je ingelogde shop-sessie.",
   "permissions": ["storage"],
   "host_permissions": [
