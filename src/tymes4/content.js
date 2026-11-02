@@ -29,6 +29,26 @@
   const EVENT_KEY = 'ntsEvent';
   const LOG_MAX = 300;
   const PLACE_KEY = 'ntsPlaceMode';
+  // Seats you picked in the seat picker, per match: without this a refresh
+  // (and a resumed search) would take any seat in that section.
+  const desiredKey = id => 'ntsDesired:' + id;
+  function saveDesired() {
+    if (state.eventId == null) return;
+    const out = {};
+    for (const [vbb, set] of Object.entries(state.desiredSeats)) if (set && set.size) out[vbb] = [...set];
+    try {
+      if (Object.keys(out).length) window.localStorage.setItem(desiredKey(state.eventId), JSON.stringify(out));
+      else window.localStorage.removeItem(desiredKey(state.eventId));
+    } catch (e) { /* not kept */ }
+  }
+  function loadDesired(id) {
+    const out = {};
+    try {
+      const raw = JSON.parse(window.localStorage.getItem(desiredKey(id)) || '{}');
+      for (const [vbb, ids] of Object.entries(raw)) if (Array.isArray(ids) && ids.length) out[vbb] = new Set(ids);
+    } catch (e) { /* none */ }
+    return out;
+  }
 
   const state = {
     events: [],
@@ -807,7 +827,7 @@
   // its own channel until you check out there. Away matches: page channel only.
   const CHANNEL_KEY = 'ntsChannels';
   const ORDERS_KEY = 'ntsChannelOrders';
-  const chan = { list: null, tokens: new Map(), orders: {}, failed: new Map() };   // failed: id -> when
+  const chan = { list: null, tokens: new Map(), orders: {}, failed: new Map(), events: new Map() };   // failed: id -> when
   const CHANNEL_RETRY_MS = 5 * 60 * 1000;
 
   const pageChannel = () => {
@@ -851,6 +871,19 @@
     return data.Token;
   }
 
+  // This match's event record in another channel, at most every 30 s.
+  async function channelSaleOpen(id, tok) {
+    const have = chan.events.get(id);
+    if (have && have.eventId === state.eventId && Date.now() - have.at < 30000) return have.open;
+    let open = false;
+    try {
+      const ev = (await getEventsRaw(tok)).find(i => i.EventId === state.eventId);
+      open = !!(ev && isOnSale(ev));
+    } catch (e) { open = false; }
+    chan.events.set(id, { eventId: state.eventId, at: Date.now(), open });
+    return open;
+  }
+
   function saveChannelOrders() {
     try { window.sessionStorage.setItem(ORDERS_KEY, JSON.stringify(chan.orders)); } catch (e) { /* not kept */ }
   }
@@ -873,6 +906,10 @@
         chan.failed.set(c.Id, Date.now());
         continue;
       }
+      // That channel's own sale status (the second-chance sale can open at
+      // another moment than the regular one).
+      if (!state.tryEarly && !(await channelSaleOpen(c.Id, tok))) continue;
+      state.otherOpen = true;
       const order = chan.orders[c.Id] || (chan.orders[c.Id] = { reservationId: null, reservationUID: null, orderId: null, orderUID: null });
       const ch = { id: c.Id, label, token: tok, order };
       const venue = await getVenue(state.eventId, tok);
@@ -945,6 +982,15 @@
         .map(k => names[k] + ' ' + (fmtDuration(Date.now() - d[k]) || '0s') + ' geleden');
       return parts.length ? parts.join(' · ') : 'geen';
     } catch (e) { return 'onbekend'; }
+  }
+
+  // Is the sale open for you in this page's channel (or may it buy early)?
+  const pageSaleOpen = () => state.tryEarly || !!(state.evRecord && isOnSale(state.evRecord));
+  function earlyHold() {
+    if (state.earlyHoldNoted) return;
+    state.earlyHoldNoted = true;
+    log('⏳ Er zijn al vakken met vrije plekken, maar de verkoop is voor jou nog niet open. Ik koop vanaf jouw moment' +
+      (state.watch.opensAt ? ' (' + fmtLocal(state.watch.opensAt) + ')' : '') + '; eerder alleen met "vóór mijn moment".');
   }
 
   // What the search card shows: a figure (free seats, spots or away sections)
@@ -1163,7 +1209,7 @@
         }
         if (vs.sections) {
           status('', { free: 0, unit: 'vrij in jouw vakken' });
-          if (isHomeVenue(venue.Sections)) await scanOtherChannels();
+          if (isHomeVenue(venue.Sections)) await scanOtherChannels();   // checks its own channel's sale
         } else {
           status('wacht tot de vakken er zijn', null);
         }
@@ -1207,7 +1253,12 @@
       // spots (unknown counts as "try it").
       const room = g => ('spots' in g ? (g.spots == null ? Infinity : g.spots) : g.seats.length);
       const todo = home ? sameSection(gathered, g => g.section.Name, room) : gathered;
-      if (!home || channelInScope(pageChannel())) {
+      // Sections can show free seats before your own phase (an earlier phase,
+      // other customers). Buy from your moment on, or earlier only when you
+      // ticked "vóór mijn moment" — as the away flow always did.
+      const mayBuy = !home || pageSaleOpen();
+      if (home && !mayBuy) earlyHold();
+      if (mayBuy && (!home || channelInScope(pageChannel()))) {
         for (const g of todo) {
           if (state.cart.done) break;
           if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
@@ -1865,6 +1916,8 @@
     state.totalAppeared = 0;
     state.lastPoll = 0;
     state.quietSince = 0;
+    state.earlyHoldNoted = false;
+    state.otherOpen = false;
     state.watch.prev = null;
     state.watch.prevVenue = null;
     state.watch.alerted = false;
@@ -1972,7 +2025,7 @@
     if (state.cart.done && state.cartUntil > Date.now()) return 'cart';
     if (!state.timer) return 'setup';
     const ev = state.evRecord;
-    const open = ev && (isOnSale(ev) || state.tryEarly);
+    const open = (ev && (isOnSale(ev) || state.tryEarly)) || state.otherOpen;
     return open && state.lastSections > 0 ? 'hunt' : 'wait';
   }
 
@@ -2327,7 +2380,7 @@
     };
     const clearBtn = document.createElement('button');
     clearBtn.textContent = 'wis';
-    clearBtn.addEventListener('click', () => { chosen.clear(); renderPicker(vbbId, seatData); });
+    clearBtn.addEventListener('click', () => { chosen.clear(); saveDesired(); renderPicker(vbbId, seatData); });
     const refreshBtn = document.createElement('button');
     refreshBtn.textContent = '↻';
     refreshBtn.title = 'ververs beschikbaarheid';
@@ -2382,6 +2435,7 @@
               if (!state.prefs.includes(nm)) { state.prefs.push(nm); storeSet(PREFS_KEY, state.prefs); applyPrefs(); }
             }
             cell.classList.toggle('nts-seat-chosen');
+            saveDesired();
             updateCount();
           });
         }
@@ -2445,7 +2499,8 @@
       learnStadium(venue.Sections);
       // Your sections are kept by name, so they carry over to this match.
       applyPrefs();
-      if (!preserve) state.desiredSeats = {};
+      // Picked seats belong to this match; they come back after a refresh.
+      state.desiredSeats = loadDesired(eventId);
       renderSections();
       showEventCard(venue);
       // You do not have to choose what kind of event this is; the sections say.
