@@ -1097,7 +1097,16 @@
   //   section without rows → away fixture: buy a spot in that section
   //
   // That is exactly the rule the shop itself applies (no Rows = unplaced).
+  // One round at a time: the interval and the tick at the sale moment can
+  // meet, and two rounds would go for the same seats. A round stuck on a slow
+  // shop for over 20 s no longer blocks the next one.
   async function tick() {
+    if (state.ticking && Date.now() - state.ticking < 20000) return;
+    const me = state.ticking = Date.now();
+    try { await round(); } finally { if (state.ticking === me) state.ticking = 0; }
+  }
+
+  async function round() {
     if (state.cart.done || state.reloading) return;
     if (!getToken()) { log('⚠️ Geen token in sessionStorage — ben je ingelogd?'); return; }
 
@@ -1105,9 +1114,18 @@
     // on for days. Once sections exist we switch to full speed.
     const now = Date.now();
     // Burst mode: from two minutes before the personal sale moment until two
-    // minutes after, poll at full speed so the first claim is not up to 30s late.
-    const opensAt = state.watch.opensAt ? state.watch.opensAt.getTime() : null;
-    const burst = opensAt != null && Math.abs(opensAt - now) < 2 * 60 * 1000;
+    // minutes after — and past that while the shop has not flipped yet — poll
+    // at full speed, the event record included, so the first claim is not up
+    // to 30s late.
+    const saleAt = state.watch.saleAt ? state.watch.saleAt.getTime() : null;
+    const burst = saleAt != null && now > saleAt - 2 * 60 * 1000 &&
+      (now < saleAt + 2 * 60 * 1000 || (!pageSaleOpen() && now < saleAt + 10 * 60 * 1000));
+    // Quiet only counts from the opening on: nothing free before it says nothing.
+    if (burst) state.quietSince = 0;
+    // The interval may fall up to 5 s after the moment; look right at it too.
+    if (saleAt != null && saleAt > now && saleAt - now < INTERVAL_MS && !state.saleTick) {
+      state.saleTick = setTimeout(() => { state.saleTick = null; tick(); }, saleAt - now + 300);
+    }
     if (state.lastSections === 0 && !burst && state.lastPoll && now - state.lastPoll < WAIT_INTERVAL_MS) return;
     const quiet = !burst && state.quietSince && now - state.quietSince > QUIET_AFTER_MS;
     if (quiet && state.lastPoll && now - state.lastPoll < QUIET_INTERVAL_MS) return;
@@ -1637,6 +1655,8 @@
     const isPlaceholder = !!(till && kickoff && till.getTime() === kickoff.getTime());
     const target = forUser || (isPlaceholder ? null : till);
     state.watch.opensAt = (open || !target || target.getTime() <= Date.now()) ? null : target;
+    // Kept past the moment itself (opensAt is not): the burst runs on it.
+    state.watch.saleAt = open ? null : target;
     state.watch.opensAtIsPersonal = !!forUser;
 
     const el = (tag, cls, text) => {
@@ -1738,6 +1758,7 @@
     ui.watchCard.innerHTML = '';
     ui.watchCountdown = null;          // otherwise the countdown keeps writing
     state.watch.opensAt = null;        // to an element no longer in the DOM
+    state.watch.saleAt = null;
   }
 
   async function showEventCard(venue) {
@@ -1935,6 +1956,7 @@
 
   function stop() {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    if (state.saleTick) { clearTimeout(state.saleTick); state.saleTick = null; }
     try { window.sessionStorage.removeItem(RUN_KEY); } catch (e) { /* ignore */ }
     restoreTitle();
     setRunning(false);
