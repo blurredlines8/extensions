@@ -100,6 +100,9 @@
       const view = groupView(club, me);
       const taken = new Set(view.held);
       if ((msg.seats || []).some(id => taken.has(id))) return Object.assign({ ok: false }, view);
+      // A claim with a plan is a start: "nobody holds anything yet". Two
+      // accounts can think so at once; the second must join the first.
+      if (msg.plan && (view.held.length || (g.plan && g.plan.eventId === m.eventId))) return Object.assign({ ok: false }, view);
       m.claim = { seats: msg.seats || [], at: Date.now() };
       if (msg.plan && !(g.plan && g.plan.eventId === m.eventId)) g.plan = { eventId: m.eventId, seats: msg.plan };
       return Object.assign({ ok: true }, groupView(club, me));

@@ -25,6 +25,7 @@
         "__SHOP_ORIGIN__/*"
       ],
       "js": [
+        "tixx-core.js",
         "tymes4-content.js"
       ],
       "css": [

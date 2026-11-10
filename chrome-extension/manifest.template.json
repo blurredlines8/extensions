@@ -22,7 +22,7 @@
   "content_scripts": [
     {
       "matches": ["__SHOP_ORIGIN__/*"],
-      "js": ["tymes4-content.js"],
+      "js": ["tixx-core.js", "tymes4-content.js"],
       "css": ["tymes4.css"],
       "run_at": "document_idle"
     },

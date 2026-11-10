@@ -63,7 +63,10 @@
     notifyOn: false,       // a webhook is set on the options page
     quietSince: 0,         // since when nothing has been free in your sections (0 = something is)
     channelKind: 'all',    // home matches: 'all' | 'regulier' | 'tweedekans'
-    placeMode: 'first',    // home matches: 'first' (first free, any of your sections) | 'block' (all in one section)
+    placeMode: 'first',    // home matches: 'first' (first free) | 'row' | 'cluster' (next to each other) | 'block' (one section)
+    group: false,          // home matches: buy together with accounts in other containers
+    groupView: null,       // the group as the background last described it
+    groupLogged: new Set(),
     note: '',              // one short line under it (away/placement cases)
     freeAll: null,         // free seats in the whole stadium at the last look
     cartSyncAt: 0,
@@ -795,6 +798,192 @@
     return fit ? [fit] : [];
   }
 
+  // ------------------------------------------------ next to each other ---
+  // The seat choice of the TIXX panel (tixx-core.js, loaded before this
+  // script) works on numeric ids <block><row><seat>. A Tymes4 seat maps onto
+  // that with its section id and its place in the section's grid: adjacent
+  // seats differ by one Column, the seat right behind has the same Column one
+  // Row on. Home matches only; the away flow never comes here.
+  const core = typeof SeatAssistCore !== 'undefined' ? SeatAssistCore : null;
+  const seatSid = (vbb, col) => vbb * 1e6 + col.Row * 1e3 + col.Column;
+  const SPOT_ROW = 999;   // standing places carry no seat; they count per section
+  function placedSids() {
+    const out = [];
+    for (const p of state.cart.placed || []) {
+      const vbb = p.section.VenueBuildingBlockId;
+      if (p.col && p.col.Row != null && p.col.Column != null) out.push(seatSid(vbb, p.col));
+      else for (let k = 0; k < (p.spots || 0); k++) out.push(vbb * 1e6 + SPOT_ROW * 1e3 + out.length % 1e3);
+    }
+    return out;
+  }
+
+  function onceLog(key, msg) {
+    if (state.groupLogged.has(key)) return;
+    state.groupLogged.add(key);
+    log(msg);
+  }
+
+  // Which places to go for, from `list` ([{section, seats} | {section, spots}]
+  // in your order). Returns that shape again, only what to claim, or null:
+  // claim as before (first free; "zelfde vak" alone; seats you picked).
+  async function chooseSeats(list) {
+    const together = state.placeMode === 'row' || state.placeMode === 'cluster';
+    if (!core || (!state.group && !together)) return null;
+    if (list.some(g => { const d = state.desiredSeats[g.section.VenueBuildingBlockId]; return d && d.size; })) return null;
+    const need = state.wantedCount - state.cart.acquired;
+    if (need <= 0) return [];
+    const bySid = new Map();
+    const skip = new Set();
+    for (const g of list) {
+      for (const col of g.seats || []) {
+        if (col.Row == null || col.Column == null) continue;
+        const sid = seatSid(g.section.VenueBuildingBlockId, col);
+        bySid.set(sid, { section: g.section, col });
+        const at = state.cart.seatTried.get(g.section.VenueBuildingBlockId + ':' + col.Id);
+        if (at && Date.now() - at < RETRY_MS) skip.add(sid);
+      }
+    }
+    const free = [...bySid.keys()];
+    const blocks = list.filter(g => g.seats && g.seats.length).map(g => g.section.VenueBuildingBlockId);
+    let ids;
+    if (state.group) {
+      const r = await groupPick(list, free, need, blocks, skip);
+      if (r.spots) return [r.spots];
+      ids = r.seats;
+    } else {
+      ids = soloPick(free, need, blocks, skip);
+      // Standing room keeps you together as long as all fit in one section.
+      if (!ids.length) {
+        const st = list.find(g => !(g.seats && g.seats.length) && g.spots !== 0 && (g.spots == null || g.spots >= need));
+        if (st) return [{ section: st.section, seats: [], spots: st.spots }];
+      }
+    }
+    const out = [];
+    for (const sid of ids) {
+      const x = bySid.get(sid);
+      if (!x) continue;
+      let g = out.find(o => o.section === x.section);
+      if (!g) out.push(g = { section: x.section, seats: [] });
+      g.seats.push(x.col);
+    }
+    return out;
+  }
+
+  // One account, "naast elkaar": the first stretch of adjacent seats in your
+  // order (one row, or over two rows right behind each other). With seats of
+  // this run already in the cart: only seats that touch them.
+  function soloPick(free, need, blocks, skip) {
+    const maxRows = state.placeMode === 'cluster' ? 2 : 1;
+    const mine = placedSids().filter(id => core.rowIdxOf(id) !== SPOT_ROW);
+    if (mine.length) {
+      const r = core.groupJoin(free, mine, { mine: need, maxRows, skip });
+      if (r && r.gap === 0) return r.seats;
+      onceLog('solojoin', '🪑 Naast je stoelen in de winkelwagen is niets vrij; ik wacht tot er iets vrijkomt.');
+      return [];
+    }
+    const got = core.pickSeats(free, { want: need, mode: state.placeMode, maxRows, blocks, skip });
+    if (got.length < need) {
+      onceLog('solo' + need, '🪑 Nog geen ' + need + ' stoelen naast elkaar vrij in je vakken; ik wacht.');
+      return [];
+    }
+    state.groupLogged.clear();
+    return got;
+  }
+
+  // ------------------------------------------------------------- group ---
+  // Several accounts, each in its own Firefox container, buying seats next to
+  // each other — like the TIXX panel, with the same background store (one
+  // for all containers, see tixx/background.js). Each account buys only its
+  // own share, within its own purchase right, after its own turn.
+  const GROUP_KEY = 'ntsGroup';
+  const GROUP_CLUB = 'tymes4:' + location.origin;
+
+  async function groupSend(op, extra) {
+    if (!ext || !ext.runtime || !ext.runtime.sendMessage) return null;
+    try {
+      const v = await ext.runtime.sendMessage(Object.assign({ type: 'group', op, club: GROUP_CLUB }, extra || {}));
+      if (v && !v.error) { state.groupView = v; render(); }
+      return v && !v.error ? v : null;
+    } catch (e) { return null; }   // no background (reloaded extension)
+  }
+
+  function groupSync() {
+    if (!state.group) return Promise.resolve(null);
+    return groupSend('update', {
+      eventId: state.eventId, want: state.wantedCount, cart: placedSids(),
+      config: { eventId: state.eventId },
+    });
+  }
+
+  // Joining without a match chosen: take the one another member chose.
+  function adoptGroupMatch() {
+    const v = state.groupView;
+    if (!v || state.eventId != null) return;
+    const src = v.members.find(m => !m.me && m.config && m.config.eventId != null &&
+      state.events.some(e => e.eventId === Number(m.config.eventId)));
+    if (!src) return;
+    ui.event.value = String(src.config.eventId);
+    ui.event.dispatchEvent(new Event('change'));
+    log('👥 Wedstrijd overgenomen van #' + src.n + '.');
+  }
+
+  // This account's share. Nobody in the group holds anything yet: room for
+  // the whole group (two rows at most) and a share at one end of it. Else:
+  // seats touching what the group holds, never further away — then it waits.
+  // "Zelfde vak": one section for the whole group, any place in it (standing
+  // too). Returns { seats: [sid] } or { spots: {section, seats: [], spots} }.
+  async function groupPick(list, free, need, blocks, skip) {
+    const none = { seats: [] };
+    const v = await groupSync();
+    if (!v) {
+      onceLog('nobg', '⚠️ Groep niet bereikbaar; ik kies alleen voor dit account.');
+      return { seats: soloPick(free, need, blocks, skip) };
+    }
+    const anchor = v.held.concat(placedSids());
+    const total = Math.max(need, v.total);
+    let pick = null, plan = null;
+    if (state.placeMode === 'block') {
+      const room = g => (g.seats && g.seats.length ? g.seats.length : g.spots == null ? Infinity : g.spots);
+      let g;
+      if (!anchor.length) {
+        g = list.find(x => room(x) >= total);
+        if (!g) { onceLog('noblock', '👥 Nog geen vak met plek voor alle ' + total + ' (zelfde vak); ik wacht.'); return none; }
+      } else {
+        const counts = new Map();
+        for (const h of anchor) counts.set(core.blockOf(h), (counts.get(core.blockOf(h)) || 0) + 1);
+        const block = [...counts].sort((a, b) => b[1] - a[1])[0][0];
+        g = list.find(x => x.section.VenueBuildingBlockId === block);
+        if (!g || room(g) < need) {
+          onceLog('blockfull' + block, '👥 In het vak van de groep' + (g ? ' (' + g.section.Name + ')' : '') + ' is nu niet genoeg vrij; ik wacht.');
+          return none;
+        }
+      }
+      if (!(g.seats && g.seats.length)) return { spots: { section: g.section, seats: [], spots: g.spots } };
+      const ids = free.filter(id => core.blockOf(id) === g.section.VenueBuildingBlockId && !skip.has(id) && !anchor.includes(id));
+      pick = core.anyInBlock(ids, need);
+      if (!anchor.length) plan = pick;   // marks a start: a second one at once must join it
+    } else if (!anchor.length) {
+      const r = core.groupStart(free, { mine: need, total, blocks, skip });
+      if (!r) { onceLog('noroom', '👥 Nog geen plek voor de groep in je vakken; ik wacht.'); return none; }
+      if (r.room < total) onceLog('small' + r.room, '👥 Geen plek voor alle ' + total + ' samen; wel voor ' + r.room + '. Daar begin ik.');
+      pick = r.seats;
+      plan = r.plan;
+    } else {
+      const r = core.groupJoin(free, anchor, { mine: need, plan: v.plan, skip });
+      if (!r) { onceLog('nojoin', '👥 Geen vrije stoelen bij de groep in je vakken; ik blijf kijken.'); return none; }
+      if (r.gap > 0) {
+        onceLog('gap' + r.gap, '👥 Naast de groep is niets vrij; het dichtstbij is ' + r.gap + ' stoel(en) ervandaan. Ik wacht tot er iets vrijkomt.');
+        return none;
+      }
+      pick = r.seats;
+    }
+    if (!pick || !pick.length) return none;
+    const res = await groupSend('claim', { seats: pick, plan });
+    if (!res || !res.ok) { log('👥 Een ander account claimt net deze stoelen; ik kies opnieuw.'); return none; }
+    state.groupLogged.clear();
+    return { seats: pick };
+  }
+
   // Seats of one match in the carts we know (this page's and other channels').
   async function seatsInCarts(eventId) {
     const orders = [];
@@ -931,9 +1120,14 @@
         extra += seats.length;
         if (seats.length) found.push({ section, seats });
       }
-      for (const f of sameSection(found, x => x.section.Name, x => x.seats.length)) {
-        if (state.cart.done) break;
-        await claimSeats(f.section, f.seats, ch);
+      const picked = await chooseSeats(found);
+      try {
+        for (const f of picked || sameSection(found, x => x.section.Name, x => x.seats.length)) {
+          if (state.cart.done) break;
+          if (f.seats.length) await claimSeats(f.section, f.seats, ch);   // standing: page channel only
+        }
+      } finally {
+        if (picked && state.group) { await groupSend('release'); await groupSync(); }
       }
     }
     if (extra && state.hunt) status(state.note, { free: state.hunt.free + extra, unit: state.hunt.unit + ' · ' + extra + ' via tweedekans' });
@@ -1277,10 +1471,17 @@
       const mayBuy = !home || pageSaleOpen();
       if (home && !mayBuy) earlyHold();
       if (mayBuy && (!home || channelInScope(pageChannel()))) {
-        for (const g of todo) {
-          if (state.cart.done) break;
-          if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
-          if (g.spots !== 0) await claimSpots(g.section, g.spots);
+        // Next to each other / with the group: the whole list, not just the
+        // "zelfde vak" pick for this account alone.
+        const picked = home ? await chooseSeats(gathered) : null;
+        try {
+          for (const g of picked || todo) {
+            if (state.cart.done) break;
+            if (g.seats.length) { await claimSeats(g.section, g.seats); continue; }
+            if (g.spots !== 0) await claimSpots(g.section, g.spots);
+          }
+        } finally {
+          if (picked && state.group) { await groupSend('release'); await groupSync(); }
         }
       }
       if (home) await scanOtherChannels();
@@ -1948,7 +2149,9 @@
     const names = state.prefs.length && (!state.sections.length || isHomeVenue(state.sections))
       ? state.prefs.map((n, i) => (i + 1) + '. ' + n).join('  ')
       : (state.sections.length ? 'alle vakken' : 'nog geen vakken — we wachten tot ze verschijnen');
-    log('▶️ Gestart · ' + names + ' · gewenst: ' + state.wantedCount);
+    state.groupLogged = new Set();
+    log('▶️ Gestart · ' + names + ' · gewenst: ' + state.wantedCount + (state.group ? ' · groep' : ''));
+    groupSync();
     setRunning(true);
     tick();
     state.timer = setInterval(tick, INTERVAL_MS);
@@ -2121,7 +2324,23 @@
       add('info', 'Zoekt in: ' + names.join(' en ') + ' (thuiswedstrijden)');
     }
 
-    if (state.placeMode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de plek zelf maakt niet uit (ook staanplaatsen)');
+    if (state.placeMode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de plek zelf maakt niet uit (ook staanplaatsen)' + (state.group ? ' — voor de hele groep' : ''));
+    if (state.placeMode === 'row' || state.placeMode === 'cluster') {
+      add('info', 'Naast elkaar: ' + (state.placeMode === 'row' ? 'in één rij' : 'in één rij of twee rijen recht achter elkaar') +
+        '; is dat er niet, dan wacht hij (thuiswedstrijden)');
+    }
+    if (state.group) {
+      const v = state.groupView;
+      if (!v) add('warn', 'Groep: nog geen contact met de andere tabbladen');
+      else {
+        const same = v.members.filter(m => m.same);
+        const other = v.members.length - same.length;
+        add(other ? 'warn' : same.length > 1 ? 'ok' : 'info', 'Groep: ' + same.length + ' account' + (same.length === 1 ? '' : 's') +
+          ' · ' + same.map(m => m.want).join('+') + ' = ' + v.total + ' kaarten' +
+          (other ? ' · ' + other + ' op een andere wedstrijd' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''));
+      }
+      if (Object.values(state.desiredSeats).some(d => d && d.size)) add('warn', 'Je hebt zelf stoelen gekozen: die gaan voor, de groep kiest dan niet');
+    }
 
     const r = state.right;
     const n = state.wantedCount + ' kaart' + (state.wantedCount === 1 ? '' : 'en');
@@ -2825,11 +3044,14 @@
       '    <div class="nts-h">Vakken <span class="nts-sub">klik in volgorde van voorkeur · 🪑 = kies stoelen · niets = alle</span>' +
       '      <button class="nts-refresh nts-icon" title="ververs vakken">↻</button></div>' +
       '    <div class="nts-sections"></div>' +
-      '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label></div>' +
+      '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label>' +
+      '      <label title="Thuiswedstrijden: elk account in een eigen Firefox-container, zelfde wedstrijd; ze kopen naast elkaar">' +
+      '        <input type="checkbox" class="nts-group"> 👥 samen met andere accounts</label></div>' +
       '    <details class="nts-more"><summary>Meer opties</summary>' +
       '      <div class="nts-row"><button class="nts-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
       '      <div class="nts-row"><label>Plaatsen <select class="nts-place" title="Thuiswedstrijden: waar de plekken mogen liggen">' +
-      '        <option value="first">eerste vrije in mijn vakken</option><option value="block">zelfde vak (plek maakt niet uit)</option>' +
+      '        <option value="first">eerste vrije in mijn vakken</option><option value="row">naast elkaar (één rij)</option>' +
+      '        <option value="cluster">naast elkaar (max. 2 rijen)</option><option value="block">zelfde vak (plek maakt niet uit)</option>' +
       '      </select></label></div>' +
       '      <div class="nts-row nts-kindrow" style="display:none"><label>Soort <select class="nts-kind" title="In welke verkoopkanalen hij zoekt (thuiswedstrijden)">' +
       '        <option value="all">alles</option><option value="regulier">alleen regulier</option><option value="tweedekans">alleen tweedekans</option>' +
@@ -2894,6 +3116,7 @@
       } catch (e) { /* not kept */ }
       if (state.eventId != null) loadSections(state.eventId, false);
       else clearEventCard();
+      groupSync();
       render();
     });
     ui.count.addEventListener('change', () => {
@@ -2901,6 +3124,7 @@
       state.wantedCount = n >= 1 ? n : 1;
       ui.count.value = String(state.wantedCount);
       try { window.localStorage.setItem(COUNT_KEY, String(state.wantedCount)); } catch (e) { /* not kept */ }
+      groupSync();
       render();
     });
     ui.early.addEventListener('change', () => {
@@ -2923,13 +3147,31 @@
     ui.reloadBtn.addEventListener('click', reloadCart);
     ui.clearBtn.addEventListener('click', clearCart);
     ui.place = panel.querySelector('.nts-place');
-    try { const m = window.localStorage.getItem(PLACE_KEY); if (m === 'first' || m === 'block') state.placeMode = m; } catch (e) { /* default */ }
+    try { const m = window.localStorage.getItem(PLACE_KEY); if (['first', 'row', 'cluster', 'block'].includes(m)) state.placeMode = m; } catch (e) { /* default */ }
     ui.place.value = state.placeMode;
     ui.place.addEventListener('change', () => {
       state.placeMode = ui.place.value;
       try { window.localStorage.setItem(PLACE_KEY, state.placeMode); } catch (e) { /* not kept */ }
       render();
     });
+    ui.group = panel.querySelector('.nts-group');
+    try { state.group = window.localStorage.getItem(GROUP_KEY) === '1'; } catch (e) { /* off */ }
+    ui.group.checked = state.group;
+    ui.group.addEventListener('change', async () => {
+      state.group = ui.group.checked;
+      try { window.localStorage.setItem(GROUP_KEY, state.group ? '1' : '0'); } catch (e) { /* not kept */ }
+      if (state.group) {
+        log('👥 Groep aan: zet dit ook aan in de andere containers, zelfde wedstrijd. Ieder koopt zijn eigen aantal, naast elkaar.');
+        await groupSync();
+        adoptGroupMatch();
+      } else {
+        await groupSend('leave');
+        state.groupView = null;
+      }
+      render();
+    });
+    // Keep the group current while setting up; a running search syncs itself.
+    setInterval(() => { if (state.group && !state.timer) groupSync(); }, 15000);
     ui.kind = panel.querySelector('.nts-kind');
     try { const k = window.localStorage.getItem(CHANNEL_KEY); if (['all', 'regulier', 'tweedekans'].includes(k)) state.channelKind = k; } catch (e) { /* default */ }
     ui.kind.value = state.channelKind;
@@ -3023,7 +3265,7 @@
     diagMark('pageLoad');
     // Load the match list, bring back the chosen match, and resume a search
     // that was running in this tab before the page loaded.
-    loadEvents().then(restoreSelection);
+    loadEvents().then(restoreSelection).then(() => { if (state.group) groupSync().then(adoptGroupMatch); });
   }
 
   buildPanel();
