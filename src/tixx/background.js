@@ -43,6 +43,7 @@
   // the same seats. Memory only: a group lives as long as the browser runs.
   const groups = {};
   const CLAIM_MS = 30 * 1000;   // a claim in flight; longer means it died
+  const MOVE_MS = 2 * 60 * 1000; // a move nobody finished by then is dropped
 
   function memberKey(sender) {
     const tab = sender && sender.tab;
@@ -52,23 +53,34 @@
 
   function groupView(club, me) {
     const g = groups[club];
-    if (!g) return { members: [], held: [], total: 0, plan: null };
+    if (!g) return { members: [], held: [], total: 0, plan: null, owner: null, move: null };
     const now = Date.now();
     const mine = g.members[me];
     const eventId = mine ? mine.eventId : null;
     const members = [];
     const held = [];
     let total = 0;
+    const move = g.move && g.move.eventId === eventId && now - g.move.at < MOVE_MS ? g.move : null;
     for (const [key, m] of Object.entries(g.members)) {
       const same = m.eventId === eventId;
       const claiming = m.claim && now - m.claim.at < CLAIM_MS ? m.claim.seats : [];
-      members.push({ me: key === me, n: m.n, want: m.want, cart: m.cart.length, eventId: m.eventId, same, config: m.config });
+      members.push({
+        me: key === me, n: m.n, want: m.want, cart: m.cart.length, eventId: m.eventId, same, config: m.config,
+        seats: same && key !== me ? m.cart.slice() : [],
+      });
       if (!same) continue;
       total += m.want;
-      if (key !== me) held.push(...m.cart, ...claiming);
+      if (key === me) continue;
+      held.push(...m.cart, ...claiming);
+      // Seats a move gave this member: nobody else in the group takes them.
+      const to = move && move.assign[m.n];
+      if (to && m.moved !== move.id) held.push(...to);
     }
     const plan = g.plan && g.plan.eventId === eventId ? g.plan.seats : null;
-    return { members, held, total, plan };
+    // The owner: the first one through who claimed, and so chose the spot.
+    const owner = g.plan && g.plan.eventId === eventId ? g.plan.owner : null;
+    const moveView = move ? { id: move.id, by: move.by, mine: mine && mine.moved !== move.id ? move.assign[mine.n] || null : null } : null;
+    return { members, held, total, plan, owner, move: moveView };
   }
 
   function onGroup(msg, sender) {
@@ -104,11 +116,24 @@
       // accounts can think so at once; the second must join the first.
       if (msg.plan && (view.held.length || (g.plan && g.plan.eventId === m.eventId))) return Object.assign({ ok: false }, view);
       m.claim = { seats: msg.seats || [], at: Date.now() };
-      if (msg.plan && !(g.plan && g.plan.eventId === m.eventId)) g.plan = { eventId: m.eventId, seats: msg.plan };
+      if (msg.plan && !(g.plan && g.plan.eventId === m.eventId)) g.plan = { eventId: m.eventId, seats: msg.plan, owner: m.n };
       return Object.assign({ ok: true }, groupView(club, me));
     }
     if (msg.op === 'release') {
       m.claim = null;
+      return groupView(club, me);
+    }
+    // The last one through found a new cluster for everyone and bought its
+    // own share: the others move to theirs (`assign`: n → seats).
+    if (msg.op === 'move') {
+      g.move = { id: Date.now(), eventId: m.eventId, by: m.n, assign: msg.assign || {}, at: Date.now() };
+      g.plan = { eventId: m.eventId, seats: msg.plan || [], owner: m.n };
+      return groupView(club, me);
+    }
+    if (msg.op === 'moved') {
+      m.moved = msg.id;
+      const mv = g.move;
+      if (mv && mv.id === msg.id && Object.keys(mv.assign).every(n => Object.values(g.members).some(x => String(x.n) === n && x.moved === mv.id))) g.move = null;
       return groupView(club, me);
     }
     return groupView(club, me);

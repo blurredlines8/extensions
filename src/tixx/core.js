@@ -263,7 +263,9 @@
   // the one in the row before. Fewer rows beat more; then the straightest
   // stack; then not leaving a lone free seat behind (the shop refuses picks
   // that strand one: "ungenutzter Anschlussplatz").
-  function clusterInBlock(ids, want, maxRows, geo) {
+  // `keep` (a Set, for a re-plan): seats the group holds already. Then the
+  // group that keeps most of them wins, before fewer rows and straightness.
+  function clusterInBlock(ids, want, maxRows, geo, keep) {
     const rows = runsByRow(ids);
     const minPer = want >= 4 ? 2 : 1;
     let best = null;
@@ -286,11 +288,15 @@
 
     for (const r0 of [...rows.keys()].sort((a, b) => a - b)) {
       for (let k = 1; k <= maxRows && k * minPer <= want; k++) {
-        if (best && best.k < k) break;
+        if (!keep && best && best.k < k) break;
         const walk = (i, left, prev, picked, cost) => {
           if (i === k) {
             if (left !== 0) return;
-            if (!best || k < best.k || (k === best.k && cost < best.cost)) {
+            if (keep) {
+              const seats = picked.flatMap(p => p.seats);
+              const score = cost + (k - 1) * 3 - seats.filter(id => keep.has(id)).length * 50;
+              if (!best || score < best.score) best = { k, cost, score, seats };
+            } else if (!best || k < best.k || (k === best.k && cost < best.cost)) {
               best = { k, cost, seats: picked.flatMap(p => p.seats) };
             }
             return;
@@ -308,7 +314,7 @@
               if (s.hi < prev.lo - 0.5 || s.lo > prev.hi + 0.5) continue;
               c += Math.abs(s.mid - prev.mid) + Math.abs(s.seats.length - prev.seats.length) * 0.25;
             }
-            if (best && k === best.k && c >= best.cost) continue;
+            if (!keep && best && k === best.k && c >= best.cost) continue;
             walk(i + 1, left - s.seats.length, s, picked.concat([s]), c);
           }
         };
@@ -504,6 +510,75 @@
     return best ? { seats: best.seats, gap: best.gap } : null;
   }
 
+  // Do these seats form one group: each reachable from the others through
+  // neighbours in the same row or seats right behind/in front?
+  function clustered(ids, geo) {
+    if (ids.length < 2) return true;
+    const left = new Set(ids);
+    const touch = (a, b) => blockOf(a) === blockOf(b) && (
+      (rowIdxOf(a) === rowIdxOf(b) && Math.abs(seatIdxOf(a) - seatIdxOf(b)) === 1) ||
+      (Math.abs(rowIdxOf(a) - rowIdxOf(b)) === 1 && Math.abs(alongRow(a, geo) - alongRow(b, geo)) <= 0.5));
+    const todo = [ids[0]];
+    left.delete(ids[0]);
+    while (todo.length) {
+      const a = todo.pop();
+      for (const b of [...left]) if (touch(a, b)) { left.delete(b); todo.push(b); }
+    }
+    return left.size === 0;
+  }
+
+  // The last account through, with a group that is not one cluster (or no
+  // room next to it): a new cluster for everyone, where seats the group holds
+  // count as free and keeping most of them wins. `members`: [{ n, seats, want }]
+  // with `me` the one asking (it buys first; it holds nothing outside the
+  // plan). Returns { plan, assign: Map n → seats, movers: [n], kept } or null.
+  function groupReplan(freeIds, members, opts) {
+    const geo = opts.geo;
+    const skip = opts.skip || new Set();
+    const ok = id => !skip.has(id) && (!opts.accept || opts.accept(id));
+    const held = members.flatMap(m => m.seats);
+    const keep = new Set(held);
+    const total = members.reduce((a, m) => a + m.want, 0);
+    const pool = [...new Set([...[...freeIds].filter(ok), ...held])];
+    const order = [...new Set([...(opts.blocks || []), ...held.map(blockOf)])];
+    let best = null;
+    for (const block of order) {
+      const ids = pool.filter(id => blockOf(id) === block).sort((a, b) => a - b);
+      if (ids.length < total) continue;
+      const seats = clusterInBlock(ids, total, opts.maxRows || 2, geo, keep);
+      if (!seats) continue;
+      const kept = seats.filter(id => keep.has(id)).length;
+      if (!best || kept > best.kept) best = { seats, kept };
+    }
+    if (!best) return null;
+    const inPlan = new Set(best.seats);
+    const free = new Set(pool);
+    const assign = new Map();
+    const movers = [];
+    let rest = best.seats.filter(id => !keep.has(id));
+    for (const m of members) {
+      if (m.seats.length && m.seats.every(id => inPlan.has(id)) && m.seats.length >= m.want) assign.set(m.n, m.seats.slice());
+    }
+    const take = (own, want) => {
+      const more = want - own.length;
+      if (more <= 0) return own.slice(0, want);
+      if (rest.length < more) return null;
+      const got = shareOf(rest, more, free, geo);
+      rest = rest.filter(id => !got.includes(id));
+      return own.concat(got);
+    };
+    const me = members.find(m => m.n === opts.me);
+    const others = members.filter(m => m.n !== opts.me && !assign.has(m.n));
+    for (const m of [me, ...others]) {
+      if (!m || assign.has(m.n)) continue;
+      const got = take(m.seats.filter(id => inPlan.has(id)), m.want);
+      if (!got) return null;
+      assign.set(m.n, got);
+      if (m.n !== opts.me) movers.push(m.n);
+    }
+    return { plan: best.seats, assign, movers, kept: best.kept };
+  }
+
   // "Zelfde vak" for a group: the first account picks the first block (in
   // your order) with room for the whole group and takes its share there; the
   // others take any free seats in the block the group holds. Fewer than
@@ -656,7 +731,7 @@
     decodeAvailability, decodeMapping, isResaleCategory,
     parseVenuePage, standOf, blocksFromSeatmap, seatLabels, seatGeometry,
     parseSeatCard, parseCart, pickSeats, parseLimits, blockLimit, saleBlocks,
-    groupStart, groupJoin, strandedBy, groupBlockStart, groupBlockJoin, anyInBlock,
+    groupStart, groupJoin, strandedBy, groupBlockStart, groupBlockJoin, anyInBlock, clustered, groupReplan,
     parseSchedule, parseSaleCell, dateKey, parseQueue,
   };
   if (typeof module === 'object' && module.exports) module.exports = api;

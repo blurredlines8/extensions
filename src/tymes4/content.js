@@ -67,6 +67,8 @@
     group: false,          // home matches: buy together with accounts in other containers
     groupView: null,       // the group as the background last described it
     groupLogged: new Set(),
+    adopted: null,         // { n, items }: what this tab took over from another member
+    userStopped: false,    // you pressed Stop: the group does not start this tab again
     note: '',              // one short line under it (away/placement cases)
     freeAll: null,         // free seats in the whole stadium at the last look
     cartSyncAt: 0,
@@ -911,20 +913,81 @@
     if (!state.group) return Promise.resolve(null);
     return groupSend('update', {
       eventId: state.eventId, want: state.wantedCount, cart: placedSids(),
-      config: { eventId: state.eventId },
+      config: {
+        eventId: state.eventId, placeMode: state.placeMode, channelKind: state.channelKind,
+        running: !!state.timer, started: !!state.timer || (state.eventId != null && followedFor() === state.eventId),
+      },
     });
   }
+  const PLACE_TEXT = { first: 'eerste vrije', row: 'naast elkaar (één rij)', cluster: 'naast elkaar (max. 2 rijen)', block: 'zelfde vak' };
 
-  // Joining without a match chosen: take the one another member chose.
+  // Joining without a match chosen: take the match and choices another
+  // member made. Your sections are shared by all containers already.
   function adoptGroupMatch() {
     const v = state.groupView;
     if (!v || state.eventId != null) return;
     const src = v.members.find(m => !m.me && m.config && m.config.eventId != null &&
       state.events.some(e => e.eventId === Number(m.config.eventId)));
     if (!src) return;
-    ui.event.value = String(src.config.eventId);
+    const c = src.config;
+    const ev = state.events.find(e => e.eventId === Number(c.eventId));
+    const items = [ev.name];
+    if (PLACE_TEXT[c.placeMode]) {
+      state.placeMode = c.placeMode; ui.place.value = c.placeMode;
+      try { window.localStorage.setItem(PLACE_KEY, state.placeMode); } catch (e) { /* not kept */ }
+      items.push('plaatsen: ' + PLACE_TEXT[c.placeMode]);
+    }
+    if (['all', 'regulier', 'tweedekans'].includes(c.channelKind)) {
+      state.channelKind = c.channelKind; ui.kind.value = c.channelKind;
+      try { window.localStorage.setItem(CHANNEL_KEY, state.channelKind); } catch (e) { /* not kept */ }
+      if (c.channelKind !== 'all') items.push('soort: alleen ' + c.channelKind);
+    }
+    if (state.prefs.length) items.push('vakken ' + state.prefs.join(', '));
+    state.adopted = { n: src.n, items };
+    ui.event.value = String(c.eventId);
     ui.event.dispatchEvent(new Event('change'));
-    log('👥 Wedstrijd overgenomen van #' + src.n + '.');
+    log('👥 Overgenomen van account #' + src.n + ': ' + items.join(' · ') + '.');
+  }
+
+  // Another member of the group started on this match: this tab goes along,
+  // unless you stopped it yourself. Once per match per tab (kept across page
+  // loads): after checking out, a member still searching must not make this
+  // tab buy again.
+  const FOLLOW_KEY = 'ntsFollowed';
+  const followedFor = () => { try { return Number(window.sessionStorage.getItem(FOLLOW_KEY)) || null; } catch (e) { return null; } };
+  function followGroup() {
+    const v = state.groupView;
+    if (!state.group || !v || state.timer || state.starting || state.userStopped || state.eventId == null) return;
+    if (state.cart.done || followedFor() === state.eventId) return;
+    const src = v.members.find(m => !m.me && m.config && Number(m.config.eventId) === state.eventId && (m.config.started || m.config.running));
+    if (!src) return;
+    log('👥 Account #' + src.n + ' is gestart; dit tabblad start mee (en gaat zelf door de wachtrij).');
+    start();
+  }
+
+  // Back to a blank setup, so the group's choice can be taken over. Your
+  // amount stays (it is per account), and so do your sections: those are
+  // shared by all containers already.
+  function resetChoices() {
+    if (state.timer) stop();
+    state.userStopped = false;
+    state.adopted = null;
+    try {
+      window.sessionStorage.removeItem(FOLLOW_KEY);
+      const ls = window.localStorage;
+      for (let i = ls.length - 1; i >= 0; i--) { const k = ls.key(i); if (k && k.startsWith('ntsDesired:')) ls.removeItem(k); }
+      ls.removeItem(PLACE_KEY);
+      ls.removeItem(CHANNEL_KEY);
+    } catch (e) { /* ignore */ }
+    state.desiredSeats = {};
+    state.placeMode = 'first'; ui.place.value = 'first';
+    state.channelKind = 'all'; ui.kind.value = 'all';
+    state.tryEarly = false; ui.early.checked = false;
+    ui.event.value = '';
+    ui.event.dispatchEvent(new Event('change'));
+    log('🧹 Keuzes gewist (wedstrijd, gekozen stoelen, plaatsen, soort, vóór mijn moment). Aantal en vakken blijven.');
+    if (state.group) groupSync().then(() => { adoptGroupMatch(); followGroup(); });
+    render();
   }
 
   // This account's share. Nobody in the group holds anything yet: room for
@@ -941,6 +1004,9 @@
     }
     const anchor = v.held.concat(placedSids());
     const total = Math.max(need, v.total);
+    if (anchor.length && v.owner && !v.members.some(m => m.me && m.n === v.owner)) {
+      onceLog('owner' + v.owner, '👥 Account #' + v.owner + ' was als eerste door en koos de plek; ik sluit daarbij aan.');
+    }
     let pick = null, plan = null;
     if (state.placeMode === 'block') {
       const room = g => (g.seats && g.seats.length ? g.seats.length : g.spots == null ? Infinity : g.spots);
@@ -970,18 +1036,146 @@
       plan = r.plan;
     } else {
       const r = core.groupJoin(free, anchor, { mine: need, plan: v.plan, skip });
-      if (!r) { onceLog('nojoin', '👥 Geen vrije stoelen bij de groep in je vakken; ik blijf kijken.'); return none; }
-      if (r.gap > 0) {
-        onceLog('gap' + r.gap, '👥 Naast de groep is niets vrij; het dichtstbij is ' + r.gap + ' stoel(en) ervandaan. Ik wacht tot er iets vrijkomt.');
-        return none;
+      const meN = (v.members.find(m => m.me) || {}).n;
+      const others = v.members.filter(m => !m.me && m.same);
+      // The last one through: everyone else has their tickets already.
+      const last = others.length > 0 && others.every(m => m.cart >= m.want);
+      const whole = core.clustered(anchor);
+      // Something rather than nothing: the closest seats to the group, else
+      // a cluster of our own in your sections.
+      const nearest = why => {
+        const near = r && r.seats && r.seats.length ? r.seats
+          : core.pickSeats(free, { want: need, mode: 'cluster', maxRows: 2, blocks, skip });
+        if (near.length < need) { onceLog('nojoin', '👥 Nergens ' + need + ' stoelen bij elkaar vrij in je vakken; ik blijf kijken.'); return null; }
+        log('👥 ' + why + ' Ik koop zo dichtbij mogelijk' +
+          (last ? '.' : '; zodra het laatste account binnen is, kijkt die of de groep alsnog één cluster kan worden.'));
+        return near;
+      };
+      if (r && r.gap === 0 && (!last || whole)) {
+        pick = r.seats;
+      } else if (last && !placedSids().length) {
+        const members = others.map(m => ({ n: m.n, seats: m.seats, want: m.seats.length })).concat([{ n: meN, seats: [], want: need }]);
+        const rp = core.groupReplan(free, members, { me: meN, blocks, maxRows: 2, skip });
+        if (rp) {
+          pick = rp.assign.get(meN);
+          if (rp.movers.length) {
+            state.pendingMove = { plan: rp.plan, assign: Object.fromEntries(rp.movers.map(n => [n, rp.assign.get(n)])) };
+            log('👥 Jij bent de laatste. Nieuwe plek voor alle ' + rp.plan.length + ' gevonden' + (rp.kept ? ' (' + rp.kept + ' stoelen van de groep blijven staan)' : '') +
+              '; ik koop eerst mijn deel, daarna ' + (rp.movers.length > 1 ? 'verhuizen ' : 'verhuist ') + rp.movers.map(n => '#' + n).join(' en ') + '.');
+          } else {
+            log('👥 Jij bent de laatste en maakt de groep compleet.');
+          }
+        } else {
+          pick = nearest('Jij bent de laatste, maar er is nergens plek voor de hele groep.');
+        }
+      } else {
+        pick = nearest(r ? 'Naast de groep is niets vrij (dichtstbij ' + r.gap + ' stoel(en) ervandaan).' : 'Bij de groep is niets vrij.');
       }
-      pick = r.seats;
+      if (!pick) return none;
     }
     if (!pick || !pick.length) return none;
     const res = await groupSend('claim', { seats: pick, plan });
     if (!res || !res.ok) { log('👥 Een ander account claimt net deze stoelen; ik kies opnieuw.'); return none; }
     state.groupLogged.clear();
+    if (plan) log('👥 Jij bent als eerste door: jij kiest de plek voor de hele groep (' + total + ' kaarten).');
     return { seats: pick };
+  }
+
+  // After the last one bought its share of a new plan: tell the others to move.
+  async function flushMove() {
+    const mv = state.pendingMove;
+    if (!mv) return;
+    state.pendingMove = null;
+    if (state.cart.acquired < state.wantedCount) return;
+    await groupSend('move', mv);
+    log('👥 Mijn deel van de nieuwe plek is binnen; de andere accounts verhuizen nu.');
+  }
+
+  // The last one through found a new cluster for everyone and bought its own
+  // share: empty this cart and take my share of it. Runs with the search
+  // stopped, while this tab holds its seats. Because of the purchase limit it
+  // gives back first; when the new seats are gone after all, it takes the old
+  // ones back. Seats in another sales channel's cart are not moved.
+  async function followMove(v) {
+    const mv = v && v.move;
+    if (!mv || !mv.mine || state.moving || state.moveDone === mv.id || state.timer || state.eventId == null) return;
+    state.moveDone = mv.id;
+    const old = (state.cart.placed || []).slice();
+    if (old.some(p => p.channel || !p.col)) {
+      log('👥 Account #' + mv.by + ' vroeg me te verhuizen, maar mijn plaatsen zitten in een ander kanaal of zijn staplekken; ik blijf zitten.');
+      await groupSend('moved', { id: mv.id, ok: false });
+      return;
+    }
+    state.moving = true;
+    let ok = false;
+    try {
+      const target = mv.mine;
+      // Emptying the order takes everything in it: only when it holds seats,
+      // and only seats of this match (else checked out already, or not ours to drop).
+      const details = state.cart.orderId ? await getOrderDetails(state.cart.orderId, state.cart.orderUID) : null;
+      const lines = ((details && (details.OrderLines || (details.PendingOrderDetails && details.PendingOrderDetails.OrderLines))) || [])
+        .filter(l => l.ProductType !== 2 && l.ProductType !== 3 && l.Id != null);
+      if (!lines.length || lines.some(l => l.EventId != null && l.EventId !== state.eventId)) {
+        log('👥 Account #' + mv.by + ' vroeg me te verhuizen, maar ' + (lines.length ? 'mijn winkelwagen heeft ook andere kaarten' : 'mijn winkelwagen is leeg (al afgerekend?)') + '; ik doe niets.');
+        return;
+      }
+      const mine = new Set(placedSids());
+      const want = [];
+      for (const vbb of new Set(target.map(core.blockOf))) {
+        const section = state.sections.find(x => x.VenueBuildingBlockId === vbb) || { VenueBuildingBlockId: vbb, Name: String(vbb) };
+        const cols = (await getSection(vbb, state.eventId)).Rows.flatMap(r => r.Columns);
+        for (const id of target.filter(x => core.blockOf(x) === vbb)) {
+          const col = cols.find(c => c.Row != null && seatSid(vbb, c) === id);
+          if (col && (mine.has(id) || col.IsAvailableForSale === true || col.AvailableForSecondary === true)) want.push({ section, col });
+        }
+      }
+      // Still free right now? Only then give anything back.
+      if (want.length < target.length) { log('👥 De nieuwe plek voor mij is al weg; ik houd mijn stoelen.'); return; }
+      log('👥 Account #' + mv.by + ' vond een plek voor de hele groep; ik verhuis naar ' +
+        want.map(w => w.section.Name + ' rij ' + w.col.RowNumber + ' stoel ' + w.col.SeatNumber).join(', ') + '.');
+      if (state.cart.orderId) await emptyOrder(state.cart.orderId, state.cart.orderUID);
+      let got = 0;
+      for (const w of want) {
+        if (await claimSeat(w.section, w.col) === 'ok' && await placeInOrder()) { state.cart.placed.push(w); got++; }
+      }
+      ok = got === target.length;
+      if (!ok) {
+        log('👥 De nieuwe plek is net weg; ik probeer mijn oude stoelen terug.');
+        if (got && state.cart.orderId) await emptyOrder(state.cart.orderId, state.cart.orderUID);
+        let back = 0;
+        for (const p of old) {
+          if (await claimSeat(p.section, p.col) === 'ok' && await placeInOrder()) { state.cart.placed.push(p); back++; }
+        }
+        if (back < old.length) {
+          log('⚠️ Niet al mijn oude stoelen terug (' + back + '/' + old.length + '). Start opnieuw om bij de groep te zoeken.');
+          notify('attention', '👥 Verhuizen mislukt: ' + back + '/' + old.length + ' oude stoelen terug. Start dat tabblad opnieuw.', null, 'move');
+        }
+      } else {
+        log('👥 Verhuisd.');
+      }
+      state.cart.acquired = state.cart.placed.length;
+      persistCart();
+      await syncCartTime();
+    } catch (e) {
+      log('Fout bij verhuizen: ' + e.message);
+    } finally {
+      state.moving = false;
+      await groupSend('moved', { id: mv.id, ok });
+      await groupSync();
+    }
+  }
+
+  // Everyone has their tickets: say so once, from one tab (the lowest number).
+  function groupComplete(v) {
+    if (!v || state.eventId == null || state.completeSaid === state.eventId || v.move) return;
+    const same = v.members.filter(m => m.same);
+    const mine = placedSids();
+    if (same.length < 2 || !same.every(m => m.me ? mine.length >= m.want : m.cart >= m.want)) return;
+    state.completeSaid = state.eventId;
+    const seats = v.held.concat(mine);
+    const msg = '👥 Groep compleet: ' + seats.length + ' kaarten' + (core.clustered(seats) ? ' in één cluster' : ', niet als één cluster') + '. Reken nu af in elk tabblad.';
+    log(msg);
+    if (Math.min(...same.map(m => m.n)) === (same.find(m => m.me) || {}).n) notify('group_complete', msg, { seats: seatList() }, 'group:' + state.eventId);
   }
 
   // Seats of one match in the carts we know (this page's and other channels').
@@ -1129,6 +1323,7 @@
       } finally {
         if (picked && state.group) { await groupSend('release'); await groupSync(); }
       }
+      await flushMove();
     }
     if (extra && state.hunt) status(state.note, { free: state.hunt.free + extra, unit: state.hunt.unit + ' · ' + extra + ' via tweedekans' });
   }
@@ -1483,6 +1678,7 @@
         } finally {
           if (picked && state.group) { await groupSend('release'); await groupSync(); }
         }
+        await flushMove();
       }
       if (home) await scanOtherChannels();
     } catch (e) {
@@ -2134,6 +2330,7 @@
     state.cart.acquired = held;
     if (held) log('🛒 Al ' + held + ' kaart(en) in je winkelwagen; ik zoek er nog ' + (state.wantedCount - held) + ' bij.');
     try { window.sessionStorage.setItem(RUN_KEY, String(state.eventId)); } catch (e) { /* no resume then */ }
+    try { window.sessionStorage.setItem(FOLLOW_KEY, String(state.eventId)); } catch (e) { /* not kept */ }
     state.prevKeys = null;
     state.totalAppeared = 0;
     state.lastPoll = 0;
@@ -2155,6 +2352,7 @@
     setRunning(true);
     tick();
     state.timer = setInterval(tick, INTERVAL_MS);
+    groupSync();   // now with "running", so the rest of the group follows
   }
 
   function stop() {
@@ -2163,6 +2361,7 @@
     try { window.sessionStorage.removeItem(RUN_KEY); } catch (e) { /* ignore */ }
     restoreTitle();
     setRunning(false);
+    groupSync();
   }
 
   function setRunning() { render(); }
@@ -2331,13 +2530,16 @@
     }
     if (state.group) {
       const v = state.groupView;
+      if (state.adopted) add('ok', 'Overgenomen van account #' + state.adopted.n + ': ' + state.adopted.items.join(' · '));
       if (!v) add('warn', 'Groep: nog geen contact met de andere tabbladen');
       else {
         const same = v.members.filter(m => m.same);
         const other = v.members.length - same.length;
         add(other ? 'warn' : same.length > 1 ? 'ok' : 'info', 'Groep: ' + same.length + ' account' + (same.length === 1 ? '' : 's') +
-          ' · ' + same.map(m => m.want).join('+') + ' = ' + v.total + ' kaarten' +
-          (other ? ' · ' + other + ' op een andere wedstrijd' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''));
+          ' · ' + same.map(m => '#' + m.n + (m.me ? ' (jij)' : '') + (m.n === v.owner ? ' eigenaar' : '') + ' ' + m.want + (m.config && m.config.running ? ' ▶' : '')).join(' + ') +
+          ' = ' + v.total + ' kaarten' +
+          (other ? ' · ' + other + ' op een andere wedstrijd: "Keuzes wissen" neemt die van de groep over' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''));
+        if (!state.timer && same.length > 1) add('info', 'Start één account; de andere tabbladen in de groep starten dan vanzelf mee');
       }
       if (Object.values(state.desiredSeats).some(d => d && d.size)) add('warn', 'Je hebt zelf stoelen gekozen: die gaan voor, de groep kiest dan niet');
     }
@@ -3046,7 +3248,8 @@
       '    <div class="nts-sections"></div>' +
       '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label>' +
       '      <label title="Thuiswedstrijden: elk account in een eigen Firefox-container, zelfde wedstrijd; ze kopen naast elkaar">' +
-      '        <input type="checkbox" class="nts-group"> 👥 samen met andere accounts</label></div>' +
+      '        <input type="checkbox" class="nts-group"> 👥 samen met andere accounts</label>' +
+      '      <button class="nts-reset" title="Wist wedstrijd, gekozen stoelen, plaatsen en soort, zodat dit tabblad die van de groep overneemt. Aantal en vakken blijven.">🧹 Keuzes wissen</button></div>' +
       '    <details class="nts-more"><summary>Meer opties</summary>' +
       '      <div class="nts-row"><button class="nts-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
       '      <div class="nts-row"><label>Plaatsen <select class="nts-place" title="Thuiswedstrijden: waar de plekken mogen liggen">' +
@@ -3141,9 +3344,11 @@
         ? '🔄 Aan: bij een vastgelopen wachtrij ververst hij de pagina (max 3×).'
         : '🔄 Uit: hij meldt een vastgelopen wachtrij alleen.');
     });
-    ui.go.addEventListener('click', start);
-    panel.querySelector('.nts-stop').addEventListener('click', stop);
-    panel.querySelector('.nts-edit').addEventListener('click', stop);
+    ui.go.addEventListener('click', () => { state.userStopped = false; start(); });
+    // Stopped by hand: the group must not start this tab again behind your back.
+    panel.querySelector('.nts-stop').addEventListener('click', () => { state.userStopped = true; stop(); });
+    panel.querySelector('.nts-edit').addEventListener('click', () => { state.userStopped = true; stop(); });
+    panel.querySelector('.nts-reset').addEventListener('click', resetChoices);
     ui.reloadBtn.addEventListener('click', reloadCart);
     ui.clearBtn.addEventListener('click', clearCart);
     ui.place = panel.querySelector('.nts-place');
@@ -3152,6 +3357,7 @@
     ui.place.addEventListener('change', () => {
       state.placeMode = ui.place.value;
       try { window.localStorage.setItem(PLACE_KEY, state.placeMode); } catch (e) { /* not kept */ }
+      groupSync();
       render();
     });
     ui.group = panel.querySelector('.nts-group');
@@ -3162,22 +3368,34 @@
       try { window.localStorage.setItem(GROUP_KEY, state.group ? '1' : '0'); } catch (e) { /* not kept */ }
       if (state.group) {
         log('👥 Groep aan: zet dit ook aan in de andere containers, zelfde wedstrijd. Ieder koopt zijn eigen aantal, naast elkaar.');
+        state.userStopped = false;
         await groupSync();
         adoptGroupMatch();
+        followGroup();
       } else {
         await groupSend('leave');
         state.groupView = null;
+        state.adopted = null;
       }
       render();
     });
-    // Keep the group current while setting up; a running search syncs itself.
-    setInterval(() => { if (state.group && !state.timer) groupSync(); }, 15000);
+    // Keep the group current, also while waiting for the sale (rounds only
+    // sync when they buy) and after the background restarted (an update).
+    // Every 3 s while this tab holds seats (a move must not wait), else 15 s.
+    let groupAt = 0;
+    setInterval(() => {
+      if (!state.group || state.moving) return;
+      if (!state.cart.done && Date.now() - groupAt < 15000) return;
+      groupAt = Date.now();
+      groupSync().then(v => { adoptGroupMatch(); followGroup(); followMove(v); groupComplete(v); });
+    }, 3000);
     ui.kind = panel.querySelector('.nts-kind');
     try { const k = window.localStorage.getItem(CHANNEL_KEY); if (['all', 'regulier', 'tweedekans'].includes(k)) state.channelKind = k; } catch (e) { /* default */ }
     ui.kind.value = state.channelKind;
     ui.kind.addEventListener('change', () => {
       state.channelKind = ui.kind.value;
       try { window.localStorage.setItem(CHANNEL_KEY, state.channelKind); } catch (e) { /* not kept */ }
+      groupSync();
       render();
     });
     loadChannels().then(async list => {
@@ -3265,7 +3483,7 @@
     diagMark('pageLoad');
     // Load the match list, bring back the chosen match, and resume a search
     // that was running in this tab before the page loaded.
-    loadEvents().then(restoreSelection).then(() => { if (state.group) groupSync().then(adoptGroupMatch); });
+    loadEvents().then(restoreSelection).then(() => { if (state.group) groupSync().then(() => { adoptGroupMatch(); followGroup(); }); });
   }
 
   buildPanel();
