@@ -24,3 +24,5 @@ AGENTS.md
 
 # HAR-exports bevatten sessiecookies en tokens — nooit committen
 *.har
+
+.DS_Store
