@@ -2,7 +2,7 @@
   "addons": {
     "seat-assist@local": {
       "updates": [
-        { "version": "1.2.17", "update_link": "https://github.com/blurredlines8/extensions/releases/download/v1.2.17/seat-assist-firefox-1.2.17.xpi" }
+        { "version": "1.2.18", "update_link": "https://github.com/blurredlines8/extensions/releases/download/v1.2.18/seat-assist-firefox-1.2.18.xpi" }
       ]
     }
   }
