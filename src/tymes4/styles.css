@@ -553,6 +553,7 @@
 #nts-panel .nts-ck-bad .nts-ck-i { background: var(--nts-red-bg); color: var(--nts-red-text); }
 #nts-panel .nts-ck-bad .nts-ck-t { color: var(--nts-red-text); }
 #nts-panel .nts-ck-t { flex: 1; min-width: 0; }
+#nts-panel .nts-ck-b { padding: 2px 8px; font-size: 11.5px; }
 @media (prefers-color-scheme: light) {
   #nts-panel .nts-ck-warn .nts-ck-i { background: #fdf3d8; color: #8a6100; }
 }

@@ -20,12 +20,15 @@
   const MIN_REFRESH_MS = 5000;
   // Before the plan exists (sale not open yet) only the venue page is checked.
   const WAIT_MS = 60000;
-  // Around a sale start you set yourself ("verkoopstart"), from two minutes
-  // before until a quarter of an hour after, both the venue page and the
-  // event list are checked every few seconds, like refreshing by hand.
+  // Around a known sale start (the queue page, the one you set yourself, or
+  // the club's presale table — see saleStart), from two minutes before until a
+  // quarter of an hour after, both the venue page and the event list are
+  // checked every few seconds, like refreshing by hand; plus one extra look
+  // just after the moment itself (SALE_TICK_MS), as in the Tymes4 panel.
   const FAST_MS = 5000;
   const ARM_BEFORE_MS = 2 * 60 * 1000;
   const ARM_AFTER_MS = 15 * 60 * 1000;
+  const SALE_TICK_MS = 300;
   const ERROR_BACKOFF_MS = 30000;
   // The signature on the seat-plan URLs comes from the venue page; fetch it
   // anew now and then so it never goes stale.
@@ -374,7 +377,8 @@
     return state.kind === 'resale' ? resale : !resale;
   }
 
-  const MODE_TEXT = { row: 'in één rij', cluster: 'cluster', block: 'zelfde vak', loose: 'los' };
+  // Same choices, words and order as the Tymes4 panel ('loose' = its 'first').
+  const MODE_TEXT = { loose: 'eerste vrije', row: 'naast elkaar (één rij)', cluster: 'naast elkaar (max. 3 rijen)', block: 'zelfde vak' };
 
   function markTried(id) { state.attempted.set(id, Date.now()); }
   // Seats tried within RETRY_MS; older ones are forgotten and may be tried again.
@@ -485,7 +489,7 @@
     items.push(state.eventLabel || 'wedstrijd ' + state.eventId);
     if (Array.isArray(c.prefs) && c.prefs.length && !state.prefs.length) { state.prefs = c.prefs.slice(); savePrefs(); }
     if (state.prefs.length) items.push('blokken ' + state.prefs.join(', '));
-    if (MODE_TEXT[c.mode]) { state.mode = c.mode; ui.mode.value = c.mode; items.push('stoelen: ' + MODE_TEXT[c.mode]); }
+    if (MODE_TEXT[c.mode]) { state.mode = c.mode; ui.mode.value = c.mode; items.push('plaatsen: ' + MODE_TEXT[c.mode]); }
     if (['all', 'sale', 'resale'].includes(c.kind)) {
       state.kind = c.kind; ui.kind.value = c.kind;
       items.push({ all: 'alles', sale: 'alleen verkoop', resale: 'alleen Ticketbörse' }[c.kind]);
@@ -872,7 +876,9 @@
         await loadVenue(state.eventId);
         if (!state.venue.seatmap) {
           if (!state.waitLogged) {
-            log('⏳ Nog geen stoelplan voor dit event; de verkoop is waarschijnlijk nog niet open. Ik kijk elke minuut' + (state.armTime ? ', rond ' + state.armTime + ' elke 5 s.' : '.'));
+            const st = saleStart();
+            log('⏳ Nog geen stoelplan voor dit event; de verkoop is waarschijnlijk nog niet open. Ik kijk elke minuut' +
+              (st ? ', rond ' + fmtClock(st.at) + ' (' + st.from + ') elke 5 s.' : '.'));
             state.waitLogged = true;
           }
           if (nearArm()) delay = FAST_MS;
@@ -950,6 +956,12 @@
       delay = ERROR_BACKOFF_MS;
     } finally {
       state.busy = false;
+      // One look right after a known sale moment, not up to 5 s later.
+      const st = !(state.venue && state.venue.seatmap) && saleStart();
+      if (st) {
+        const until = st.at + SALE_TICK_MS - Date.now();
+        if (until > 0 && until < delay) delay = until;
+      }
       if (state.running && !state.timer) {
         state.nextAt = Date.now() + delay;
         state.timer = setTimeout(tick, delay);
@@ -1368,7 +1380,12 @@
       else add('warn', 'Nu is geen van je vakken te koop (' + off.join(', ') + '); ik blijf ze bewaken');
     }
 
-    if (state.mode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de stoel zelf maakt niet uit' + (state.group ? ' (voor de hele groep)' : ''));
+    if (state.kind !== 'all') add('info', 'Zoekt in: ' + (state.kind === 'sale' ? 'alleen verkoop' : 'alleen Ticketbörse'));
+    if (state.mode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de stoel zelf maakt niet uit' + (state.group ? ' — voor de hele groep' : ''));
+    if (!state.group && (state.mode === 'row' || state.mode === 'cluster') && state.want > 1) {
+      add('info', 'Naast elkaar: ' + (state.mode === 'row' ? 'in één rij' : 'in één rij of max. 3 rijen recht achter elkaar, zo min mogelijk rijen') +
+        '; is dat er niet, dan wacht hij');
+    }
 
     const limits = state.venue && state.venue.limits;
     const held = state.cart ? state.cart.length : 0;
@@ -1557,11 +1574,12 @@
     return d.getTime();
   }
 
+  // Near the sale start of the chosen match, from wherever it is known.
   function nearArm() {
-    const at = armAt();
-    if (at == null) return false;
+    const st = saleStart();
+    if (!st) return false;
     const now = Date.now();
-    return now >= at - ARM_BEFORE_MS && now <= at + ARM_AFTER_MS;
+    return now >= st.at - ARM_BEFORE_MS && now <= st.at + ARM_AFTER_MS;
   }
 
   function nearSale() {
@@ -1606,7 +1624,8 @@
       }
     }
     // Wake up for the fast window even if the normal pace would sleep past it.
-    const at = armAt();
+    const st = saleStart();
+    const at = st ? st.at : null;
     const untilFast = at != null && at - ARM_BEFORE_MS > Date.now() ? at - ARM_BEFORE_MS - Date.now() + 500 : Infinity;
     setTimeout(watchEvents, Math.min(every, nearArm() ? FAST_MS : EVENTS_POLL_NEAR_MS, untilFast));
   }
@@ -1996,7 +2015,7 @@
       '<div class="sat-body">' +
       '  <div class="sat-phase"></div>' +
       '  <div class="sat-row sat-cartbar"><button class="sat-start sat-pay">Afrekenen →</button>' +
-      '    <button class="sat-clear sat-clear-cart">🗑 Leegmaken</button>' +
+      '    <button class="sat-clear sat-clear-cart" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Leegmaken</button>' +
       '    <button class="sat-reload-cart" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad</button></div>' +
       '  <div class="sat-row sat-runbar"><button class="sat-stop">■ Stop</button>' +
       '    <button class="sat-edit" title="Stopt en gaat terug naar instellen">Wijzigen</button></div>' +
@@ -2009,22 +2028,22 @@
       '      <button class="sat-refresh sat-icon" title="Vrije plaatsen verversen">↻</button></div>' +
       '    <div class="sat-sections"></div>' +
       '    <div class="sat-row"><label>Aantal <input type="number" class="sat-count" min="1" value="1"></label>' +
-      '      <label title="Rond dit tijdstip (vandaag) kijkt hij elke 5 seconden">Verkoopstart <input type="time" class="sat-armtime"></label></div>' +
-      '    <div class="sat-row"><label title="Koop samen met accounts in andere Firefox-containers: naast elkaar, max 2 rijen. Elk account koopt zijn eigen aantal.">' +
-      '      <input type="checkbox" class="sat-group"> Samen zitten met andere accounts</label>' +
-      '      <button class="sat-reset" title="Wist wedstrijd, stoelen, soort en verkoopstart, zodat dit tabblad die van de groep overneemt. Aantal en blokken blijven.">🧹 Keuzes wissen</button></div>' +
+      '      <label title="Rond dit tijdstip (vandaag) kijkt hij elke 5 seconden. Leeg laten als de wachtrij of de verkooptabel de tijd al geeft.">Verkoopstart <input type="time" class="sat-armtime"></label></div>' +
+      '    <div class="sat-row"><label title="Koop samen met accounts in andere Firefox-containers, naast elkaar (max. 2 rijen). Elk account koopt zijn eigen aantal.">' +
+      '      <input type="checkbox" class="sat-group"> 👥 Samen met andere accounts</label>' +
+      '      <button class="sat-reset" title="Wist wedstrijd, stoelen, plaatsen, soort en verkoopstart, zodat dit tabblad die van de groep overneemt. Aantal en vakken blijven.">🧹 Keuzes wissen</button></div>' +
       '    <div class="sat-sales"></div>' +
       '    <details class="sat-more"><summary>Meer opties</summary>' +
-      '      <div class="sat-row"><label>Stoelen <select class="sat-mode" title="Hoe de stoelen bij elkaar moeten liggen. Samen zitten: naast elkaar, of met \'zelfde vak\' alles in één vak">' +
-      '        <option value="row">naast elkaar in één rij</option><option value="cluster">cluster (max 3 rijen)</option>' +
-      '        <option value="block">zelfde vak (plek maakt niet uit)</option><option value="loose">los</option>' +
-      '      </select></label>' +
-      '      <label>Soort <select class="sat-kind" title="Welke plaatsen tellen mee">' +
+      '      <div class="sat-row"><label>Plaatsen <select class="sat-mode" title="Waar de plekken mogen liggen. Samen met andere accounts: naast elkaar, of met \'zelfde vak\' alles in één vak">' +
+      '        <option value="loose">eerste vrije in mijn vakken</option><option value="row">naast elkaar (één rij)</option>' +
+      '        <option value="cluster">naast elkaar (max. 3 rijen)</option><option value="block">zelfde vak (plek maakt niet uit)</option>' +
+      '      </select></label></div>' +
+      '      <div class="sat-row"><label>Soort <select class="sat-kind" title="Welke plaatsen tellen mee">' +
       '        <option value="all">alles</option><option value="sale">alleen verkoop</option><option value="resale">alleen Ticketbörse</option>' +
       '      </select></label></div>' +
+      '      <div class="sat-row"><input type="text" class="sat-armmatch" placeholder="Auto-start: wedstrijd waarvan de naam … bevat" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
       '      <div class="sat-row"><button class="sat-relearn" title="Vergeet het opgeslagen stadion en leer het opnieuw — als de vakken niet kloppen">🏟 Stadion opnieuw leren</button></div>' +
       '      <div class="sat-row"><button class="sat-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
-      '      <div class="sat-row"><input type="text" class="sat-armmatch" placeholder="Auto-start: wedstrijd waarvan de naam … bevat" title="Zodra een wedstrijd met deze tekst in de naam tickets krijgt, kiest hij die en start hij"></div>' +
       '      <div class="sat-row"><button class="sat-reload-more" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad winkelwagen</button>' +
       '        <button class="sat-clear sat-clear-more" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
       '    </details>' +

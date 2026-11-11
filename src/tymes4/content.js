@@ -331,6 +331,8 @@
       }
       if (prev.status === 'QUEUED' && q.status !== 'QUEUED') {
         log('🎉 Je bent door de wachtrij.');
+        notify('queue_done', '🚦 Door de wachtrij' + (eventName() ? ' (' + eventName() + ')' : '') +
+          (state.timer ? ' — de extensie zoekt verder.' : '.'));
         beep(); flashTitle('🎉 DOOR DE RIJ');
       }
     }
@@ -872,10 +874,10 @@
   }
 
   // One account, "naast elkaar": the first stretch of adjacent seats in your
-  // order (one row, or over two rows right behind each other). With seats of
-  // this run already in the cart: only seats that touch them.
+  // order (one row, or up to three rows right behind each other, fewer rows
+  // first). With seats of this run already in the cart: only seats that touch them.
   function soloPick(free, need, blocks, skip) {
-    const maxRows = state.placeMode === 'cluster' ? 2 : 1;
+    const maxRows = state.placeMode === 'cluster' ? CLUSTER_ROWS : 1;
     const mine = placedSids().filter(id => core.rowIdxOf(id) !== SPOT_ROW);
     if (mine.length) {
       const r = core.groupJoin(free, mine, { mine: need, maxRows, skip });
@@ -919,7 +921,9 @@
       },
     });
   }
-  const PLACE_TEXT = { first: 'eerste vrije', row: 'naast elkaar (één rij)', cluster: 'naast elkaar (max. 2 rijen)', block: 'zelfde vak' };
+  // Same choices, words and order as the TIXX panel.
+  const CLUSTER_ROWS = 3;
+  const PLACE_TEXT = { first: 'eerste vrije', row: 'naast elkaar (één rij)', cluster: 'naast elkaar (max. 3 rijen)', block: 'zelfde vak' };
 
   // Joining without a match chosen: take the match and choices another
   // member made. Your sections are shared by all containers already.
@@ -1466,6 +1470,18 @@
 
   // Names → this venue's VenueBuildingBlockIds. A preference only means
   // something on the home ground; elsewhere every section counts, as before.
+  // "Stadion opnieuw leren", as in the TIXX panel: forget it and take the
+  // sections of the open match, or the next home match that shows them.
+  async function relearnStadium() {
+    state.stadium = null;
+    await storeSet(STADIUM_KEY, null);
+    log('🏟 Stadion vergeten; ik leer het opnieuw.');
+    if (isHomeVenue(state.sections)) learnStadium(state.sections);
+    else log('🏟 Deze wedstrijd toont (nog) geen thuisvakken; het stadion leer ik zodra ik ze zie.');
+    applyPrefs();
+    if (!state.awaySections.length) renderSections();
+    render();
+  }
   function prefsFor(sections) {
     if (!state.prefs.length || !isHomeVenue(sections)) return null;
     const vbb = new Map(sections.map(x => [x.Name, x.VenueBuildingBlockId]));
@@ -2472,7 +2488,7 @@
     c.textContent = '';
     if (ph === 'hunt' || ph === 'cart') return;
     let bad = 0;
-    const add = (status, text) => {
+    const add = (status, text, btn) => {
       if (status === 'bad') bad++;
       const row = document.createElement('div');
       row.className = 'nts-ck nts-ck-' + status;
@@ -2483,6 +2499,14 @@
       t.className = 'nts-ck-t';
       t.textContent = text;
       row.append(i, t);
+      if (btn) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'nts-ck-b';
+        b.textContent = btn.label;
+        b.addEventListener('click', btn.on);
+        row.appendChild(b);
+      }
       c.appendChild(row);
     };
     const sess = state.session;
@@ -2504,6 +2528,8 @@
     if (state.eventId != null) {
       if (!state.sections.length && state.awaySections.length) {
         add('info', 'Uitwedstrijd: ' + (state.selectedAway.length ? state.selectedAway.length + ' sectie(s) gekozen' : 'eerste vrije sectie') + ' (bus/combi, zoals altijd)');
+      } else if (!state.stadium && !isHomeVenue(state.sections)) {
+        add('warn', 'Stadion nog onbekend: vakken kiezen kan zodra een thuiswedstrijd één keer vakken toont');
       } else if (!state.prefs.length) {
         add('info', 'Alle vakken (geen voorkeur gekozen)');
       } else if (state.sections.length && isHomeVenue(state.sections)) {
@@ -2516,7 +2542,8 @@
       }
     }
 
-    add(state.notifyOn ? 'ok' : 'info', state.notifyOn ? 'Meldingen staan aan (webhook)' : 'Meldingen staan uit (instellen onder Meer opties)');
+    add(state.notifyOn ? 'ok' : 'info', state.notifyOn ? 'Meldingen staan aan (webhook)' : 'Meldingen staan uit',
+      state.notifyOn ? null : { label: 'Instellen', on: openOptions });
 
     if (chan.list && chan.list.length > 1) {
       const names = chan.list.filter(c => channelInScope(c.Id)).map(channelLabel);
@@ -2525,7 +2552,7 @@
 
     if (state.placeMode === 'block') add('info', 'Zelfde vak: alle plekken in één vak, de plek zelf maakt niet uit (ook staanplaatsen)' + (state.group ? ' — voor de hele groep' : ''));
     if (state.placeMode === 'row' || state.placeMode === 'cluster') {
-      add('info', 'Naast elkaar: ' + (state.placeMode === 'row' ? 'in één rij' : 'in één rij of twee rijen recht achter elkaar') +
+      add('info', 'Naast elkaar: ' + (state.placeMode === 'row' ? 'in één rij' : 'in één rij of max. 3 rijen recht achter elkaar, zo min mogelijk rijen') +
         '; is dat er niet, dan wacht hij (thuiswedstrijden)');
     }
     if (state.group) {
@@ -2538,7 +2565,8 @@
         add(other ? 'warn' : same.length > 1 ? 'ok' : 'info', 'Groep: ' + same.length + ' account' + (same.length === 1 ? '' : 's') +
           ' · ' + same.map(m => '#' + m.n + (m.me ? ' (jij)' : '') + (m.n === v.owner ? ' eigenaar' : '') + ' ' + m.want + (m.config && m.config.running ? ' ▶' : '')).join(' + ') +
           ' = ' + v.total + ' kaarten' +
-          (other ? ' · ' + other + ' op een andere wedstrijd: "Keuzes wissen" neemt die van de groep over' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''));
+          (other ? ' · ' + other + ' op een andere wedstrijd' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''),
+          other ? { label: 'Keuzes wissen', on: resetChoices } : null);
         if (!state.timer && same.length > 1) add('info', 'Start één account; de andere tabbladen in de groep starten dan vanzelf mee');
       }
       if (Object.values(state.desiredSeats).some(d => d && d.size)) add('warn', 'Je hebt zelf stoelen gekozen: die gaan voor, de groep kiest dan niet');
@@ -3234,7 +3262,7 @@
       '  <div class="nts-row nts-cartbar"><button class="nts-start nts-pay">Afrekenen →</button>' +
       '    <button class="nts-start nts-pay2" style="display:none">Afrekenen →</button>' +
       '    <button class="nts-clear nts-clear-cart" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Leegmaken</button>' +
-      '    <button class="nts-reload nts-reload-cart" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad</button></div>' +
+      '    <button class="nts-reload nts-reload-cart" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad</button></div>' +
       '  <div class="nts-counter"></div>' +
       '  <div class="nts-row nts-runbar"><button class="nts-stop">■ Stop</button>' +
       '    <button class="nts-edit" title="Stopt en gaat terug naar instellen">Wijzigen</button></div>' +
@@ -3242,19 +3270,18 @@
       '  <div class="nts-setup">' +
       '    <div class="nts-h">Wedstrijd</div>' +
       '    <div class="nts-row"><select class="nts-event"><option value="">— kies wedstrijd —</option></select>' +
-      '      <button class="nts-events nts-icon" title="Wedstrijden laden">↻</button></div>' +
-      '    <div class="nts-h">Vakken <span class="nts-sub">klik in volgorde van voorkeur · 🪑 = kies stoelen · niets = alle</span>' +
+      '      <button class="nts-events nts-icon" title="Wedstrijdlijst verversen">↻</button></div>' +
+      '    <div class="nts-h">Vakken <span class="nts-sub">klik in volgorde van voorkeur · 🪑 = kies stoelen · niets gekozen = alle</span>' +
       '      <button class="nts-refresh nts-icon" title="ververs vakken">↻</button></div>' +
       '    <div class="nts-sections"></div>' +
-      '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label>' +
-      '      <label title="Thuiswedstrijden: elk account in een eigen Firefox-container, zelfde wedstrijd; ze kopen naast elkaar">' +
-      '        <input type="checkbox" class="nts-group"> 👥 samen met andere accounts</label>' +
+      '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label></div>' +
+      '    <div class="nts-row"><label title="Thuiswedstrijden: koop samen met accounts in andere Firefox-containers, naast elkaar (max. 2 rijen). Elk account koopt zijn eigen aantal.">' +
+      '      <input type="checkbox" class="nts-group"> 👥 Samen met andere accounts</label>' +
       '      <button class="nts-reset" title="Wist wedstrijd, gekozen stoelen, plaatsen en soort, zodat dit tabblad die van de groep overneemt. Aantal en vakken blijven.">🧹 Keuzes wissen</button></div>' +
       '    <details class="nts-more"><summary>Meer opties</summary>' +
-      '      <div class="nts-row"><button class="nts-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
-      '      <div class="nts-row"><label>Plaatsen <select class="nts-place" title="Thuiswedstrijden: waar de plekken mogen liggen">' +
+      '      <div class="nts-row"><label>Plaatsen <select class="nts-place" title="Thuiswedstrijden: waar de plekken mogen liggen. Samen met andere accounts: naast elkaar, of met \'zelfde vak\' alles in één vak">' +
       '        <option value="first">eerste vrije in mijn vakken</option><option value="row">naast elkaar (één rij)</option>' +
-      '        <option value="cluster">naast elkaar (max. 2 rijen)</option><option value="block">zelfde vak (plek maakt niet uit)</option>' +
+      '        <option value="cluster">naast elkaar (max. 3 rijen)</option><option value="block">zelfde vak (plek maakt niet uit)</option>' +
       '      </select></label></div>' +
       '      <div class="nts-row nts-kindrow" style="display:none"><label>Soort <select class="nts-kind" title="In welke verkoopkanalen hij zoekt (thuiswedstrijden)">' +
       '        <option value="all">alles</option><option value="regulier">alleen regulier</option><option value="tweedekans">alleen tweedekans</option>' +
@@ -3263,8 +3290,10 @@
       '        <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment reserveren</label></div>' +
       '      <div class="nts-row"><label title="Ververst de pagina als de wachtrij-token meer dan een minuut verlopen is, zodat de shop hem weer oppakt. Maximaal 3 keer. Houdt je plek NIET warm bij inactiviteit.">' +
       '        <input type="checkbox" class="nts-requeue"> &#128260; herstel wachtrij</label></div>' +
-      '      <div class="nts-row"><button class="nts-reload" title="Verwijder de gecarte stoelen uit de winkelwagen en zet ze opnieuw">🔄 Herlaad winkelwagen</button>' +
-      '        <button class="nts-clear" title="Haalt alle kaarten uit de winkelwagen en laat hem leeg. De kaarten worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
+      '      <div class="nts-row"><button class="nts-relearn" title="Vergeet het opgeslagen stadion en leer het opnieuw — als de vakken niet kloppen">🏟 Stadion opnieuw leren</button></div>' +
+      '      <div class="nts-row"><button class="nts-notify-btn" title="Webhook voor meldingen, bijv. Home Assistant → Telegram">🔔 Meldingen instellen…</button></div>' +
+      '      <div class="nts-row"><button class="nts-reload" title="Haalt je stoelen uit de winkelwagen en zet ze er meteen weer in — voor een stoel die vast lijkt te zitten">🔄 Herlaad winkelwagen</button>' +
+      '        <button class="nts-clear" title="Haalt alle kaarten uit de winkelwagen. Ze worden vrijgegeven.">🗑 Winkelwagen leegmaken</button></div>' +
       '    </details>' +
       '    <div class="nts-row"><button class="nts-start nts-go">▶ Start</button></div>' +
       '  </div>' +
@@ -3410,6 +3439,7 @@
     ui.pay2 = panel.querySelector('.nts-pay2');
     ui.reloadCart = panel.querySelector('.nts-reload-cart');
     panel.querySelector('.nts-notify-btn').addEventListener('click', openOptions);
+    panel.querySelector('.nts-relearn').addEventListener('click', relearnStadium);
     storeGet(NOTIFY_KEY).then(url => { state.notifyOn = !!url; render(); });
     if (ext && ext.storage && ext.storage.onChanged) {
       ext.storage.onChanged.addListener(ch => {
