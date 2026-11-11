@@ -89,12 +89,15 @@
   // (…/areaplan/venue/event/<id>): the signed parameters for the Eventim API,
   // the stands/blocks that have free seats, and the price categories.
   function parseVenuePage(html) {
-    const out = { loggedIn: null, title: null, seatmap: null, areas: [], prices: [], limits: parseLimits(html) };
+    const out = { loggedIn: null, title: null, venue: null, seatmap: null, areas: [], prices: [], limits: parseLimits(html) };
     const lm = /"user_logged":(true|false)/.exec(html);
     if (lm) out.loggedIn = lm[1] === 'true';
     // Title: the info button's label, else the hidden <h1> ("A - B | Shop | …").
     const tm = /aria-label="Event Info - ([^"]+)"/i.exec(html) || /<h1[^>]*>([^<|]+)\|/.exec(html);
     if (tm) out.title = tidy(tm[1]);
+    // The stadium this match is played in ("Allianz-Arena"), as on its card.
+    const vn = /id="venue-name(?:-\d+)?"[^>]*>([^<]+)</.exec(html);
+    if (vn) out.venue = tidy(vn[1]) || null;
 
     const at = html.indexOf('new OLS6.Seatmap(');
     if (at >= 0) {
@@ -721,6 +724,26 @@
   }
 
   // dd.mm.yyyy from free text ("Dienstag, 27.10.2026 20:45").
+  // The shop's own club: the team on (nearly) every match card. Null when the
+  // list cannot tell (fewer than two matches with that team).
+  function clubTeam(events) {
+    const n = new Map();
+    for (const e of events) for (const t of new Set([e.home, e.guest].filter(Boolean))) n.set(t, (n.get(t) || 0) + 1);
+    let best = null, bestN = 1, tie = false;
+    for (const [t, k] of n) {
+      if (k > bestN) { best = t; bestN = k; tie = false; } else if (k === bestN) tie = true;
+    }
+    return best && !tie ? best : null;
+  }
+
+  // 'home' | 'away' | null for one match card, given the club's team.
+  function matchSide(event, club) {
+    if (!event || !club || !event.home || !event.guest) return null;
+    if (event.home === club) return 'home';
+    if (event.guest === club) return 'away';
+    return null;
+  }
+
   function dateKey(text) {
     const m = /(\d{1,2})\.(\d{1,2})\.(\d{4})/.exec(text || '');
     return m ? [m[1].padStart(2, '0'), m[2].padStart(2, '0'), m[3]].join('.') : null;
@@ -731,6 +754,7 @@
     decodeAvailability, decodeMapping, isResaleCategory,
     parseVenuePage, standOf, blocksFromSeatmap, seatLabels, seatGeometry,
     parseSeatCard, parseCart, pickSeats, parseLimits, blockLimit, saleBlocks,
+    clubTeam, matchSide,
     groupStart, groupJoin, strandedBy, groupBlockStart, groupBlockJoin, anyInBlock, clustered, groupReplan,
     parseSchedule, parseSaleCell, dateKey, parseQueue,
   };

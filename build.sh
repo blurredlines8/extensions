@@ -94,6 +94,16 @@ done
 # '&' betekent in een sed-vervanging "de match"; letterlijk houden.
 SCHEDULES_SED="${TIXX_SCHEDULES//&/\\&}"
 
+# TIXX — optioneel: ingebouwd stadion per club als startpunt (JSON
+# {"<club>":{"venue":…,"blocks":[{name,stand,ga}]}}); een geleerd stadion gaat
+# altijd voor. Zonder waarde: {}. Eerst controleren dat het geldige JSON is.
+export TIXX_STADIUMS="${TIXX_STADIUMS:-}"
+[ -z "$TIXX_STADIUMS" ] && TIXX_STADIUMS='{}'
+if ! node -e 'const j=JSON.parse(process.env.TIXX_STADIUMS); if (typeof j!=="object"||Array.isArray(j)) process.exit(1)' 2>/dev/null; then
+  echo "✗ TIXX_STADIUMS is geen geldig JSON-object."
+  exit 1
+fi
+
 # In de manifests staat elke Tymes4-placeholder als één array-element
 # ("__X__/*"); dat wordt hier uitgeschreven tot één element per club.
 subst() {  # subst <bron> <doel>
@@ -111,6 +121,9 @@ for dir in "$FF" "$CH"; do
   for pair in "${FILES[@]}"; do
     subst "$SRC/${pair%%:*}" "$dir/${pair#*:}"
   done
+  # JSON via node, niet via sed (|, & en / in de waarde).
+  node -e 'const fs=require("fs"); for (const f of process.argv.slice(1)) fs.writeFileSync(f, fs.readFileSync(f,"utf8").split("__TIXX_STADIUMS__").join(process.env.TIXX_STADIUMS));' \
+    "$dir/tixx-content.js"
   subst "$dir/manifest.template.json" "$dir/manifest.json.tmp"
   awk -v perms="$SCHEDULE_PERMS" '/"__TIXX_SCHEDULE_PERMS__",/ { printf "%s", perms; next } { print }' \
     "$dir/manifest.json.tmp" > "$dir/manifest.json"

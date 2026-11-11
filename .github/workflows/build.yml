@@ -42,6 +42,7 @@ jobs:
           TIXX_SHOP_ORIGIN: ${{ secrets.TIXX_SHOP_ORIGIN }}
           TIXX_SHOP_PATHS: ${{ secrets.TIXX_SHOP_PATHS }}
           TIXX_SCHEDULES: ${{ secrets.TIXX_SCHEDULES }}
+          TIXX_STADIUMS: ${{ secrets.TIXX_STADIUMS }}
         run: ./build.sh
 
       - name: Versiebump terugcommitten

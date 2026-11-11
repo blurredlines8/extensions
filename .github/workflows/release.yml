@@ -73,6 +73,7 @@ jobs:
           TIXX_SHOP_ORIGIN: ${{ secrets.TIXX_SHOP_ORIGIN }}
           TIXX_SHOP_PATHS: ${{ secrets.TIXX_SHOP_PATHS }}
           TIXX_SCHEDULES: ${{ secrets.TIXX_SCHEDULES }}
+          TIXX_STADIUMS: ${{ secrets.TIXX_STADIUMS }}
           GH_REPO: ${{ github.repository }}
         run: ./build.sh sign
 

@@ -90,8 +90,6 @@
     prevAway: null,            // previous away-section counts, for change detection
     awaySections: [],          // named away sections from the cross-sell step
     selectedAway: [],          // VenueBuildingBlockIds in click order
-    tryEarly: false,           // attempt a claim before your own sale phase
-    earlyLogged: false,
     prevKeys: null,        // available seat keys from the previous tick (for churn)
     totalAppeared: 0,      // cumulative seats that appeared over the run
     reloading: false,      // guards against ticking while a reload runs
@@ -778,6 +776,12 @@
       state.cart.acquired = state.cart.placed.length;
       persistCart();
       log('🔄 Herladen klaar (' + back + '/' + placed.length + ' terug in winkelwagen).');
+      // New hold, new countdown: read it from the shop now (not at the next
+      // minute's check), and let the 5-minute warning come again.
+      for (const k of [...notified]) if (k.startsWith('exp:')) notified.delete(k);
+      state.cartSyncAt = Date.now();
+      await syncCartTime();
+      render();
     } finally {
       state.reloading = false;
       ui.reloadBtn.disabled = false;
@@ -972,7 +976,11 @@
   // Back to a blank setup, so the group's choice can be taken over. Your
   // amount stays (it is per account), and so do your sections: those are
   // shared by all containers already.
+  // "🧹 Reset": back to a clean panel — no match, no picked seats, no section
+  // preference, defaults for every option, one ticket, group off. What was
+  // learned (the stadium) and the webhook stay.
   function resetChoices() {
+    if (!window.confirm('Alles resetten? Wedstrijd, vakvoorkeur (geldt voor alle tabbladen van deze club), gekozen stoelen, opties en aantal gaan terug naar de standaard; samen met andere accounts gaat uit.')) return;
     if (state.timer) stop();
     state.userStopped = false;
     state.adopted = null;
@@ -984,15 +992,33 @@
       ls.removeItem(CHANNEL_KEY);
     } catch (e) { /* ignore */ }
     state.desiredSeats = {};
+    state.selectedAway = [];
+    state.prefs = [];
+    storeSet(PREFS_KEY, []);
+    applyPrefs();
     state.placeMode = 'first'; ui.place.value = 'first';
     state.channelKind = 'all'; ui.kind.value = 'all';
-    state.tryEarly = false; ui.early.checked = false;
+    if (ui.requeue.checked) { ui.requeue.checked = false; ui.requeue.dispatchEvent(new Event('change')); }
+    if (ui.group.checked) { ui.group.checked = false; ui.group.dispatchEvent(new Event('change')); }
+    ui.count.value = '1';
+    ui.count.dispatchEvent(new Event('change'));
     ui.event.value = '';
     ui.event.dispatchEvent(new Event('change'));
-    log('🧹 Keuzes gewist (wedstrijd, gekozen stoelen, plaatsen, soort, vóór mijn moment). Aantal en vakken blijven.');
-    if (state.group) groupSync().then(() => { adoptGroupMatch(); followGroup(); });
+    renderSections();
+    log('🧹 Reset: wedstrijd, vakvoorkeur, gekozen stoelen, opties en aantal terug naar de standaard; samen met andere accounts uit.');
     render();
   }
+
+  // Group members are on another match: drop yours and take theirs.
+  function takeGroupMatch() {
+    if (state.timer) stop();
+    state.userStopped = false;
+    state.adopted = null;
+    ui.event.value = '';
+    ui.event.dispatchEvent(new Event('change'));
+    groupSync().then(() => { adoptGroupMatch(); followGroup(); render(); });
+  }
+
 
   // This account's share. Nobody in the group holds anything yet: room for
   // the whole group (two rows at most) and a share at one end of it. Else:
@@ -1295,7 +1321,7 @@
       }
       // That channel's own sale status (the second-chance sale can open at
       // another moment than the regular one).
-      if (!state.tryEarly && !(await channelSaleOpen(c.Id, tok))) continue;
+      if (!(await channelSaleOpen(c.Id, tok))) continue;
       state.otherOpen = true;
       const order = chan.orders[c.Id] || (chan.orders[c.Id] = { reservationId: null, reservationUID: null, orderId: null, orderUID: null });
       const ch = { id: c.Id, label, token: tok, order };
@@ -1377,13 +1403,13 @@
     } catch (e) { return 'onbekend'; }
   }
 
-  // Is the sale open for you in this page's channel (or may it buy early)?
-  const pageSaleOpen = () => state.tryEarly || !!(state.evRecord && isOnSale(state.evRecord));
+  // Is the sale open for you in this page's channel?
+  const pageSaleOpen = () => !!(state.evRecord && isOnSale(state.evRecord));
   function earlyHold() {
     if (state.earlyHoldNoted) return;
     state.earlyHoldNoted = true;
     log('⏳ Er zijn al vakken met vrije plekken, maar de verkoop is voor jou nog niet open. Ik koop vanaf jouw moment' +
-      (state.watch.opensAt ? ' (' + fmtLocal(state.watch.opensAt) + ')' : '') + '; eerder alleen met "vóór mijn moment".');
+      (state.watch.opensAt ? ' (' + fmtLocal(state.watch.opensAt) + ')' : '') + '.');
   }
 
   // What the search card shows: a figure (free seats, spots or away sections)
@@ -1601,9 +1627,8 @@
       if (!secs.length) {
         // No sections, but on sale for this customer: the shop then sells
         // straight on the priced placements. That is the away-match case.
-        // Verified 2026-09-09: find-my-seat is not gated server-side, so a
-        // reservation succeeds before your own phase opens. Paying will still
-        // fail, so this stays opt-in via the "vóór mijn moment" checkbox.
+        // (find-my-seat is not gated server-side, 2026-09-09, but paying
+        // before your phase fails; reserving early was dropped 2026-11-11.)
         const onSale = state.evRecord.CurrentlyOnSaleForUser === true;
         if (!vs.sections) {
           // Named sections with their own VenueBuildingBlockId and availability.
@@ -1616,17 +1641,12 @@
             // Free away sections count as "there is something here", so the
             // monitor leaves wait mode and polls at full speed.
             state.lastSections = vrij;
-            if (onSale || state.tryEarly) { await claimAwaySection(away); return; }
+            if (onSale) { await claimAwaySection(away); return; }
             status('', { free: vrij, unit: 'van ' + away.length + ' secties vrij' });
             return;
           }
         }
-        if (!vs.sections && (onSale || (state.tryEarly && vs.priced > 0))) {
-          if (!onSale && !state.earlyLogged) {
-            state.earlyLogged = true;
-            log('⏱ Vóór je koopmoment: proberen te reserveren. Afrekenen lukt pas ' +
-                'vanaf je eigen fase.');
-          }
+        if (!vs.sections && onSale) {
           await claimSpotsByPlacements(venue);
           return;
         }
@@ -1677,8 +1697,7 @@
       const room = g => ('spots' in g ? (g.spots == null ? Infinity : g.spots) : g.seats.length);
       const todo = home ? sameSection(gathered, g => g.section.Name, room) : gathered;
       // Sections can show free seats before your own phase (an earlier phase,
-      // other customers). Buy from your moment on, or earlier only when you
-      // ticked "vóór mijn moment" — as the away flow always did.
+      // other customers). Buy from your moment on, as the away flow does.
       const mayBuy = !home || pageSaleOpen();
       if (home && !mayBuy) earlyHold();
       if (mayBuy && (!home || channelInScope(pageChannel()))) {
@@ -2465,7 +2484,7 @@
     if (state.cart.done && state.cartUntil > Date.now()) return 'cart';
     if (!state.timer) return 'setup';
     const ev = state.evRecord;
-    const open = (ev && (isOnSale(ev) || state.tryEarly)) || state.otherOpen;
+    const open = (ev && isOnSale(ev)) || state.otherOpen;
     return open && state.lastSections > 0 ? 'hunt' : 'wait';
   }
 
@@ -2566,7 +2585,7 @@
           ' · ' + same.map(m => '#' + m.n + (m.me ? ' (jij)' : '') + (m.n === v.owner ? ' eigenaar' : '') + ' ' + m.want + (m.config && m.config.running ? ' ▶' : '')).join(' + ') +
           ' = ' + v.total + ' kaarten' +
           (other ? ' · ' + other + ' op een andere wedstrijd' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''),
-          other ? { label: 'Keuzes wissen', on: resetChoices } : null);
+          other ? { label: 'Overnemen', on: takeGroupMatch } : null);
         if (!state.timer && same.length > 1) add('info', 'Start één account; de andere tabbladen in de groep starten dan vanzelf mee');
       }
       if (Object.values(state.desiredSeats).some(d => d && d.size)) add('warn', 'Je hebt zelf stoelen gekozen: die gaan voor, de groep kiest dan niet');
@@ -3277,7 +3296,7 @@
       '    <div class="nts-row nts-countrow"><label>Aantal <input type="number" class="nts-count" min="1" value="1"></label></div>' +
       '    <div class="nts-row"><label title="Thuiswedstrijden: koop samen met accounts in andere Firefox-containers, naast elkaar (max. 2 rijen). Elk account koopt zijn eigen aantal.">' +
       '      <input type="checkbox" class="nts-group"> 👥 Samen met andere accounts</label>' +
-      '      <button class="nts-reset" title="Wist wedstrijd, gekozen stoelen, plaatsen en soort, zodat dit tabblad die van de groep overneemt. Aantal en vakken blijven.">🧹 Keuzes wissen</button></div>' +
+      '      <button class="nts-reset" title="Alles terug naar de standaard: wedstrijd, vakvoorkeur, gekozen stoelen, opties en aantal; samen met andere accounts gaat uit">🧹 Reset</button></div>' +
       '    <details class="nts-more"><summary>Meer opties</summary>' +
       '      <div class="nts-row"><label>Plaatsen <select class="nts-place" title="Thuiswedstrijden: waar de plekken mogen liggen. Samen met andere accounts: naast elkaar, of met \'zelfde vak\' alles in één vak">' +
       '        <option value="first">eerste vrije in mijn vakken</option><option value="row">naast elkaar (één rij)</option>' +
@@ -3286,8 +3305,6 @@
       '      <div class="nts-row nts-kindrow" style="display:none"><label>Soort <select class="nts-kind" title="In welke verkoopkanalen hij zoekt (thuiswedstrijden)">' +
       '        <option value="all">alles</option><option value="regulier">alleen regulier</option><option value="tweedekans">alleen tweedekans</option>' +
       '      </select></label></div>' +
-      '      <div class="nts-row"><label title="find-my-seat is niet server-side afgeschermd: reserveren lukt vaak al eerder, afrekenen niet">' +
-      '        <input type="checkbox" class="nts-early"> &#9201; v&oacute;&oacute;r mijn moment reserveren</label></div>' +
       '      <div class="nts-row"><label title="Ververst de pagina als de wachtrij-token meer dan een minuut verlopen is, zodat de shop hem weer oppakt. Maximaal 3 keer. Houdt je plek NIET warm bij inactiviteit.">' +
       '        <input type="checkbox" class="nts-requeue"> &#128260; herstel wachtrij</label></div>' +
       '      <div class="nts-row"><button class="nts-relearn" title="Vergeet het opgeslagen stadion en leer het opnieuw — als de vakken niet kloppen">🏟 Stadion opnieuw leren</button></div>' +
@@ -3308,7 +3325,6 @@
     ui.event = panel.querySelector('.nts-event');
     ui.sections = panel.querySelector('.nts-sections');
     ui.count = panel.querySelector('.nts-count');
-    ui.early = panel.querySelector('.nts-early');
     ui.requeue = panel.querySelector('.nts-requeue');
     ui.go = panel.querySelector('.nts-go');
     ui.reloadBtn = panel.querySelector('.nts-reload');
@@ -3358,13 +3374,6 @@
       try { window.localStorage.setItem(COUNT_KEY, String(state.wantedCount)); } catch (e) { /* not kept */ }
       groupSync();
       render();
-    });
-    ui.early.addEventListener('change', () => {
-      state.tryEarly = ui.early.checked;
-      state.earlyLogged = false;
-      log(state.tryEarly
-        ? '⏱ Aan: hij probeert ook vóór je koopmoment te reserveren.'
-        : '⏱ Uit: hij wacht tot de verkoop voor jou opengaat.');
     });
     ui.requeue.addEventListener('change', () => {
       state.queue.autoReload = ui.requeue.checked;

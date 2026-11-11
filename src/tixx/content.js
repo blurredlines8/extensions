@@ -64,6 +64,21 @@
   // page's): the club's stadium as last seen, and your blocks by name. Block
   // ids differ per match, names and rows do not (Köln, two matches, 56 of 56).
   const STADIUM_KEY = 'tixx:stadium:' + CLUB;
+  // A starting point per club, filled in by build.sh from .env (TIXX_STADIUMS):
+  // so there are always blocks to choose from, even before any home plan was
+  // seen. A stadium learned from a real home match always wins over it.
+  const BUILTIN_STADIUMS = __TIXX_STADIUMS__;
+  const builtinStadium = () => {
+    const b = BUILTIN_STADIUMS && BUILTIN_STADIUMS[CLUB];
+    return b && Array.isArray(b.blocks) && b.blocks.length ? { blocks: b.blocks, venue: b.venue || null, at: 0, builtin: true } : null;
+  };
+  // Stored before 2026-11-11 (no stadium name): could be an away plan, so the
+  // built-in one goes first where there is one.
+  const pickStadium = stored => {
+    const ok = stored && Array.isArray(stored.blocks) && stored.blocks.length ? stored : null;
+    if (ok && ok.venue) return ok;
+    return builtinStadium() || ok;
+  };
   const PREFS_KEY = 'tixx:blocks:' + CLUB;
   // The cart holds seats for 20 minutes; the shop tells the exact rest.
   const CART_HOLD_MS = 20 * 60 * 1000;
@@ -200,7 +215,7 @@
     const sm = await apiGet('seatmap', '', { generateTiles: 'false' });
     state.blocks = core.blocksFromSeatmap(sm);
     state.geo = core.seatGeometry(sm);
-    await learnStadium(state.blocks, state.venue);
+    await learnStadium(state.blocks, state.venue, state.eventId);
     applyPrefs();
     renderBlocks();
   }
@@ -240,8 +255,20 @@
   // areaList, or else the stand of blocks with the same letter ("N 5" → Nord).
   // A plan that shares too little with what we know is another stadium: an
   // away match. That one is used as it is but not remembered.
-  async function learnStadium(blocks, venue) {
-    if (!blocks.length) return;
+  async function learnStadium(blocks, venue, eventId) {
+    if (!blocks.length) return false;
+    if (!state.events.length) {
+      try { state.events = await fetchEvents(); fillEvents(); } catch (e) { /* decide without the cards */ }
+    }
+    // An away match (the card says the club is the guest, or the plan is in
+    // another stadium than the one we know) is never remembered: its plan holds
+    // only the guest blocks (Bayern–Köln 2026-11-11: 14 blocks in the Allianz-Arena).
+    const side = sideOf(eventId, venue);
+    if (side === 'away') {
+      state.foreignVenue = true;
+      log('🏟 Uitwedstrijd' + (venue && venue.venue ? ' (' + venue.venue + ')' : '') + ': dit stoelplan onthoud ik niet als stadion; je vakvoorkeur geldt hier niet.');
+      return false;
+    }
     const prefix = n => (/^([^\d\s]+)/.exec(n) || ['', ''])[1];
     const byPrefix = new Map();
     const standById = new Map();
@@ -257,24 +284,41 @@
     // Another stadium (an away match) is one where none of your blocks exist.
     // Not "differs from what we stored": a wrong first stadium would then lock
     // out every home match for good.
-    state.foreignVenue = state.prefs.length > 0 && !state.prefs.some(n => names.has(n));
-    if (state.foreignVenue) { log('🏟 Dit stoelplan hoort bij een ander stadion; je vakvoorkeur geldt hier niet.'); return; }
-    if (old && old.blocks.length && !state.prefs.length) {
+    // Without the cards to go by (side unknown), guess from your blocks and
+    // from what we know; a known home match is simply taken.
+    state.foreignVenue = side !== 'home' && state.prefs.length > 0 && !state.prefs.some(n => names.has(n));
+    if (state.foreignVenue) { log('🏟 Dit stoelplan hoort bij een ander stadion; je vakvoorkeur geldt hier niet.'); return false; }
+    if (side !== 'home' && old && old.blocks.length && !state.prefs.length) {
       // No preference to go by: keep what we know unless this plan is mostly the same.
       const shared = blocks.filter(b => oldStand.has(b.name)).length;
-      if (shared < Math.min(blocks.length, old.blocks.length) / 2) return;
+      if (shared < Math.min(blocks.length, old.blocks.length) / 2) return false;
     }
     const next = blocks.map(b => ({
       name: b.name,
       stand: standById.get(b.id) || oldStand.get(b.name) || byPrefix.get(prefix(b.name)) || null,
       ga: !!b.ga,
     }));
-    const changed = !old || old.blocks.length !== next.length || next.some(b => oldStand.get(b.name) !== b.stand);
-    state.stadium = { blocks: next, at: Date.now() };
+    const venueName = (venue && venue.venue) || (old && old.venue) || null;
+    const changed = !old || old.blocks.length !== next.length || next.some(b => oldStand.get(b.name) !== b.stand) || old.venue !== venueName || !!old.builtin;
+    state.stadium = { blocks: next, venue: venueName, at: Date.now() };
     if (changed) {
       await storeSet(STADIUM_KEY, state.stadium);
-      log('🏟 Stadion onthouden: ' + next.length + ' vakken. Je vakvoorkeur geldt voortaan voor elke thuiswedstrijd.');
+      log('🏟 Stadion onthouden' + (venueName ? ' (' + venueName + ')' : '') + ': ' + next.length + ' vakken. Je vakvoorkeur geldt voortaan voor elke thuiswedstrijd.');
     }
+    return true;
+  }
+
+  // 'home' | 'away' | null (cannot tell) for a match: first its card in the
+  // list (home and guest team), else its stadium against the home stadium.
+  function sideOf(eventId, venue) {
+    const club = core.clubTeam(state.events);
+    const side = core.matchSide(state.events.find(e => e.id === eventId), club);
+    if (side) return side;
+    const vn = venue && venue.venue;
+    if (!vn) return null;
+    const homes = new Set(state.events.filter(e => core.matchSide(e, club) === 'home' && e.venue).map(e => e.venue));
+    if (state.stadium && state.stadium.venue) homes.add(state.stadium.venue);
+    return homes.size ? (homes.has(vn) ? 'home' : 'away') : null;
   }
 
   // Your blocks by name → this match's block ids.
@@ -289,36 +333,63 @@
     applyPrefs();
   }
 
-  // Forget the stadium and learn it again (from this match's plan if there
-  // is one, otherwise from any open one) — for when it was learned wrong.
+  // Learn the stadium again from a home match (this one if its plan is open,
+  // else any open one) — for when it was learned wrong. Nothing to learn from:
+  // keep what there is (a learned or the built-in stadium); only an old,
+  // untagged one is dropped, and then the built-in one takes its place.
   async function relearnStadium() {
+    const old = state.stadium;
     state.stadium = null;
     state.foreignVenue = false;
-    await storeSet(STADIUM_KEY, null);
-    log('🏟 Stadion vergeten; ik leer het opnieuw.');
-    if (state.blocks.length) await learnStadium(state.blocks, state.venue);
-    else await learnFromOpenMatch();
+    log('🏟 Stadion opnieuw leren (alleen van een thuiswedstrijd) …');
+    let learned = !!(state.blocks.length && await learnStadium(state.blocks, state.venue, state.eventId));
+    if (!learned) {
+      state.foreignVenue = false;
+      await learnFromOpenMatch();
+      learned = !!state.stadium;
+      if (state.blocks.length) state.foreignVenue = sideOf(state.eventId, state.venue) === 'away';
+    }
+    if (!learned) {
+      if (old && (old.venue || old.builtin)) {
+        state.stadium = old;
+        log('🏟 Het bestaande stadion blijft staan' + (old.builtin ? ' (ingebouwd startpunt)' : '') + '.');
+      } else {
+        await storeSet(STADIUM_KEY, null);
+        state.stadium = builtinStadium();
+        log(state.stadium ? '🏟 Het oude stadion is weg; het ingebouwde startpunt staat er nu.' : '🏟 Het oude stadion is weg.');
+      }
+    }
     applyPrefs();
     renderBlocks();
+    render();
   }
 
-  // No stadium known yet: learn it from any match whose plan is open now
+  // No stadium known yet: learn it from a home match whose plan is open now
   // (often there is one, e.g. on resale), without changing the chosen match.
+  // Away matches are skipped: their plan is someone else's stadium.
   async function learnFromOpenMatch() {
     try {
       const list = state.events.length ? state.events : (state.events = await fetchEvents());
       fillEvents();
-      const open = list.filter(e => e.open).sort((a, b) => (b.id === state.eventId) - (a.id === state.eventId));
+      const club = core.clubTeam(list);
+      const open = list.filter(e => e.open && core.matchSide(e, club) !== 'away')
+        .sort((a, b) => (b.id === state.eventId) - (a.id === state.eventId));
+      const keep = state.foreignVenue;
       for (const e of open) {
         const v = core.parseVenuePage(await (await shopFetch(venuePath(e.id))).text());
-        if (!v.seatmap) continue;
+        if (!v.seatmap || sideOf(e.id, v) === 'away') continue;
         const sm = await apiGet('seatmap', '', { generateTiles: 'false' }, v);
-        await learnStadium(core.blocksFromSeatmap(sm), v);
+        const ok = await learnStadium(core.blocksFromSeatmap(sm), v, e.id);
+        if (e.id !== state.eventId) state.foreignVenue = keep;
+        if (!ok) continue;
         renderBlocks();
         render();
         return;
       }
-      log('🏟 Nu staat geen wedstrijd met een stoelplan open; het stadion leer ik zodra er een is.');
+      log('🏟 Nu staat geen thuiswedstrijd met een stoelplan open' + (open.length ? ' (' + open.map(e => e.label.split(' · ')[0]).join(', ') + ' nog niet)' : '') +
+        '; het stadion leer ik zodra er een is — ook vanzelf als de extensie een thuiswedstrijd opent.');
+      renderBlocks();
+      render();
     } catch (e) { onError(e); }
   }
 
@@ -526,22 +597,44 @@
   // Back to a blank setup, so the group's choice can be taken over. Your
   // amount stays (it is per account), and so do the blocks: those are shared
   // by all containers already.
+  // "🧹 Reset": back to a clean panel — no match, no block preference,
+  // defaults for every option, one ticket, group off. What was learned (the
+  // stadium) and the webhook stay.
   function resetChoices() {
+    if (!window.confirm('Alles resetten? Wedstrijd, vakvoorkeur (geldt voor alle tabbladen van deze club), opties, verkoopstart en aantal gaan terug naar de standaard; samen met andere accounts gaat uit.')) return;
     if (state.running) stop();
     state.userStopped = false;
     state.adopted = null;
     try { window.sessionStorage.removeItem(FOLLOW_KEY); } catch (e) { /* ignore */ }
+    state.prefs = [];
+    savePrefs();
+    applyPrefs();
     state.armMatch = ''; ui.armMatch.value = '';
     state.armTime = ''; state.armDate = ''; ui.armTime.value = '';
     state.mode = 'row'; ui.mode.value = 'row';
     state.kind = 'all'; ui.kind.value = 'all';
+    if (ui.group.checked) { ui.group.checked = false; ui.group.dispatchEvent(new Event('change')); }
+    ui.count.value = '1';
+    ui.count.dispatchEvent(new Event('change'));
     ui.event.value = '';
     onEventChange();
     saveSettings();
-    log('🧹 Keuzes gewist (wedstrijd, stoelen, soort, verkoopstart). Aantal en blokken blijven.');
-    if (state.group) groupSync().then(() => { adoptGroupConfig(); followGroup(); });
+    renderBlocks();
+    log('🧹 Reset: wedstrijd, vakvoorkeur, opties, verkoopstart en aantal terug naar de standaard; samen met andere accounts uit.');
     render();
   }
+
+  // Group members are on another match: drop yours and take theirs.
+  function takeGroupMatch() {
+    if (state.running) stop();
+    state.userStopped = false;
+    state.adopted = null;
+    ui.event.value = '';
+    onEventChange();
+    saveSettings();
+    groupSync().then(() => { adoptGroupConfig(); followGroup(); render(); });
+  }
+
 
   // This account's share. Nobody in the group holds seats yet: find room for
   // the whole group (two rows at most) and take a share at one end of it.
@@ -839,6 +932,8 @@
       log('🔄 Herladen klaar (' + back + '/' + items.length + ' terug in de winkelwagen).');
       if (back) {
         state.cartUntil = Date.now() + CART_HOLD_MS;
+        for (const k of [...notified]) if (k.startsWith('exp:')) notified.delete(k);
+        state.cartSyncAt = Date.now();
         await syncCartTime();
       } else {
         state.cartUntil = 0;
@@ -1370,7 +1465,9 @@
       add('warn', 'Stadion nog onbekend: vakken kiezen kan zodra het één keer gezien is', { label: 'Stadion leren', on: learnFromOpenMatch });
     } else if (!state.prefs.length) {
       add('info', 'Alle vakken (geen voorkeur gekozen)');
+      if (state.stadium && state.stadium.builtin && !state.blocks.length) add('info', 'Stadion: ingebouwd startpunt' + (state.stadium.venue ? ' (' + state.stadium.venue + ')' : '') + '; bijgewerkt zodra een thuiswedstrijd open staat');
     } else {
+      if (state.stadium && state.stadium.builtin && !state.blocks.length) add('info', 'Stadion: ingebouwd startpunt' + (state.stadium.venue ? ' (' + state.stadium.venue + ')' : '') + '; bijgewerkt zodra een thuiswedstrijd open staat');
       const sale = state.blocks.length ? core.saleBlocks(state.venue) : null;
       const ids = new Map(state.blocks.map(b => [b.name, b.id]));
       const off = sale ? state.prefs.filter(n => !ids.has(n) || !sale.has(ids.get(n))) : [];
@@ -1414,7 +1511,7 @@
           ' · ' + same.map(m => '#' + m.n + (m.me ? ' (jij)' : '') + (m.n === v.owner ? ' eigenaar' : '') + ' ' + m.want + (m.config && m.config.running ? ' ▶' : '')).join(' + ') +
           ' = ' + v.total + ' kaarten' +
           (other ? ' · ' + other + ' op een andere wedstrijd' : same.length < 2 ? ' · zet het ook aan in de andere containers' : ''),
-          other ? { label: 'Keuzes wissen', on: resetChoices } : null);
+          other ? { label: 'Overnemen', on: takeGroupMatch } : null);
         if (!state.running && same.length > 1) add('info', 'Start één account; de andere tabbladen in de groep starten dan vanzelf mee');
       }
     }
@@ -1531,7 +1628,12 @@
       const name = core.tidy((link && link.getAttribute('aria-label')) || card.textContent).replace(/\s*-\s*(Tickets|Karten)$/i, '');
       const time = card.querySelector('.event__info--time');
       const when = time ? core.tidy(time.textContent) : '';
-      out.push({ id: Number(id), label: name + (when ? ' · ' + when : '') + (link ? '' : ' (nog geen tickets)'), date: core.dateKey(when), open: !!link });
+      // Home and guest team and the stadium, to tell home matches from away ones.
+      const txt = sel => { const n = card.querySelector(sel); return n ? core.tidy(n.textContent) || null : null; };
+      out.push({
+        id: Number(id), label: name + (when ? ' · ' + when : '') + (link ? '' : ' (nog geen tickets)'), date: core.dateKey(when), open: !!link,
+        home: txt('.event-card__heading--home'), guest: txt('.event-card__heading--away'), venue: txt('.event__info--venue .event__info-item'),
+      });
     }
     return out;
   }
@@ -2031,7 +2133,7 @@
       '      <label title="Rond dit tijdstip (vandaag) kijkt hij elke 5 seconden. Leeg laten als de wachtrij of de verkooptabel de tijd al geeft.">Verkoopstart <input type="time" class="sat-armtime"></label></div>' +
       '    <div class="sat-row"><label title="Koop samen met accounts in andere Firefox-containers, naast elkaar (max. 2 rijen). Elk account koopt zijn eigen aantal.">' +
       '      <input type="checkbox" class="sat-group"> 👥 Samen met andere accounts</label>' +
-      '      <button class="sat-reset" title="Wist wedstrijd, stoelen, plaatsen, soort en verkoopstart, zodat dit tabblad die van de groep overneemt. Aantal en vakken blijven.">🧹 Keuzes wissen</button></div>' +
+      '      <button class="sat-reset" title="Alles terug naar de standaard: wedstrijd, vakvoorkeur, opties, verkoopstart en aantal; samen met andere accounts gaat uit">🧹 Reset</button></div>' +
       '    <div class="sat-sales"></div>' +
       '    <details class="sat-more"><summary>Meer opties</summary>' +
       '      <div class="sat-row"><label>Plaatsen <select class="sat-mode" title="Waar de plekken mogen liggen. Samen met andere accounts: naast elkaar, of met \'zelfde vak\' alles in één vak">' +
@@ -2244,7 +2346,7 @@
       });
     }
     Promise.all([storeGet(STADIUM_KEY), storeGet(PREFS_KEY)]).then(([stadium, prefs]) => {
-      state.stadium = stadium && Array.isArray(stadium.blocks) ? stadium : null;
+      state.stadium = pickStadium(stadium);
       state.prefs = Array.isArray(prefs) ? prefs : [];
       applyPrefs();
       renderBlocks();
