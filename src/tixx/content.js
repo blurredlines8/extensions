@@ -1527,13 +1527,17 @@
   // The blocks to show: this match's plan when it is there, else the stadium
   // as last seen. Per block what we know right now: free seats, whether this
   // shop sells it, a lower ticket cap, resale.
+  // This match is played elsewhere: show its own plan, not our stadium.
+  const awayMatch = () => state.eventId != null && (state.foreignVenue || sideOf(state.eventId, state.venue) === 'away');
   function blockItems() {
-    const fromPlan = state.blocks.length && !state.foreignVenue;
+    const away = awayMatch();
+    if (away && !state.blocks.length) return [];
+    const fromPlan = state.blocks.length && (away || !state.foreignVenue);
     const sale = core.saleBlocks(state.venue);
     const limits = state.venue && state.venue.limits;
     const areas = (state.venue && state.venue.areas) || [];
     const resale = new Set(areas.flatMap(a => a.blocks.filter(b => b.resale).map(b => b.id)));
-    const known = new Map(((state.stadium && state.stadium.blocks) || []).map(b => [b.name, b.stand]));
+    const known = new Map(away ? [] : ((state.stadium && state.stadium.blocks) || []).map(b => [b.name, b.stand]));
     const src = fromPlan
       ? state.blocks.map(b => ({ name: b.name, id: b.id, ga: !!b.ga }))
       : ((state.stadium && state.stadium.blocks) || []).map(b => ({ name: b.name, id: null, ga: b.ga }));
@@ -1564,6 +1568,13 @@
   function renderBlocks() {
     ui.blocks.textContent = '';
     const items = blockItems();
+    const away = awayMatch();
+    if (away) {
+      const where = (state.venue && state.venue.venue) || (state.events.find(e => e.id === state.eventId) || {}).venue;
+      ui.blocks.appendChild(el('div', 'sat-hint', 'Uitwedstrijd' + (where ? ' (' + where + ')' : '') + ': je vakvoorkeur geldt hier niet, hij zoekt in alle vakken.' +
+        (items.length ? ' Dit zijn de vakken uit het stoelplan van deze wedstrijd.' : ' De vakken verschijnen zodra het stoelplan open is.')));
+      if (!items.length) { render(); return; }
+    }
     if (!items.length) {
       ui.blocks.appendChild(el('div', 'sat-hint', 'Het stadion is nog onbekend. Zodra er ergens een stoelplan open is, verschijnen de vakken hier (of klik hierboven "Stadion leren").'));
       render();
@@ -1583,7 +1594,7 @@
       const chips = el('div', 'sat-chips');
       list.sort((x, y) => x.name.localeCompare(y.name, 'de', { numeric: true }));
       for (const it of list) {
-        const idx = state.prefs.indexOf(it.name);
+        const idx = away ? -1 : state.prefs.indexOf(it.name);
         const chip = el('button', 'sat-chip' + (idx >= 0 ? ' sat-sel' : '') + (it.sale === false ? ' sat-off' : '') +
           (it.free === 0 ? ' sat-full' : '') + (it.ga ? ' sat-ga' : ''));
         chip.type = 'button';
@@ -1595,7 +1606,8 @@
           it.sale === false ? 'nu niet te koop · wordt bewaakt' : null,
           it.resale ? 'ook Ticketbörse' : null,
           it.free != null ? it.free + ' vrij' : null].filter(Boolean).join(' · ');
-        chip.addEventListener('click', () => toggleBlock(it.name));
+        if (away) chip.disabled = true;
+        else chip.addEventListener('click', () => toggleBlock(it.name));
         chips.appendChild(chip);
       }
       box.appendChild(chips);

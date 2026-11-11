@@ -597,6 +597,7 @@
   background: var(--sat-bg);
   border: 1px solid var(--sat-border-2);
 }
+#sat-panel .sat-chip:disabled { opacity: 0.8; }
 #sat-panel .sat-chip.sat-sel { background: var(--sat-green-bg); border-color: var(--sat-green); color: var(--sat-green-text); font-weight: 600; }
 /* Not on sale right now, but still watched: muted, never struck through, so
    the name stays readable. A chosen one keeps its green outline. */
