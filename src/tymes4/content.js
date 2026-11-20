@@ -1219,9 +1219,20 @@
       try { orders.push([o.orderId, o.orderUID, await channelToken(id)]); } catch (e) { /* skip that one */ }
     }
     let n = 0;
+    const mine = getInitiativeGuid();
     for (const [id, uid, tok] of orders) {
       try {
         const d = await getOrderDetails(id, uid, tok);
+        // An "initiative" (e.g. a viewing party) can sell on the same EventId
+        // as the match itself (NEC 266, 2026-11-20). Its order carries the
+        // InitiativeGuid; those tickets are not the ones we are hunting for, so
+        // only count orders from the same context as this tab (sessionStorage 'ai').
+        const og = d && (d.InitiativeGuid || (d.PendingOrderDetails && d.PendingOrderDetails.InitiativeGuid)) || null;
+        if (og !== mine) {
+          log('ℹ️ Winkelwagen van ' + (og ? 'een actie/initiatief' : 'de gewone verkoop') +
+              ' niet meegeteld voor deze wedstrijd.');
+          continue;
+        }
         const lines = (d && (d.OrderLines || (d.PendingOrderDetails && d.PendingOrderDetails.OrderLines))) || [];
         n += lines.filter(l => l.ProductType !== 2 && l.ProductType !== 3 && l.EventId === eventId).length;
       } catch (e) { /* unknown: count none */ }
